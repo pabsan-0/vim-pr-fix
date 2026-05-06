@@ -206,18 +206,16 @@ export def AddGhostText()
     var buf = bufnr('%')
     var rel = fnamemodify(bufname(buf), ':.')
 
-    # Clear *** markers from a previous suggestion apply
+    # Refresh: clear all ghost annotations for this buffer then re-add
+    prop_remove({type: 'prfix_ghost',    bufnr: buf, all: true})
     prop_remove({type: 'prfix_replaced', bufnr: buf, all: true})
 
     for c in s_comments
         if c.filename != rel | continue | endif
         var lnum = c.lnum
         if lnum < 1 || lnum > line('$') | continue | endif
-        if !empty(prop_list(lnum, {bufnr: buf, types: ['prfix_ghost']}))
-            continue
-        endif
-        var pad = repeat(' ', max([1, 80 - len(getline(lnum))]))
-        prop_add(lnum, 1, {
+        var pad = repeat(' ', max([1, 80 - strdisplaywidth(getline(lnum))]))
+        prop_add(lnum, 0, {
             bufnr:      buf,
             type:       'prfix_ghost',
             text:       pad .. '<-- change requested',
