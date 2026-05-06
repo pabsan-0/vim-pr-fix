@@ -1,26 +1,29 @@
 vim9script
 
-# ── State ──────────────────────────────────────────────────────────────────────
 var s_comments:    list<dict<any>> = []
 var s_marked:      list<bool>      = []
+var s_worktree_buf: number          = -1
 var s_comment_buf: number          = -1
 var s_qf_buf:      number          = -1
 var s_last_idx:    number          = -1
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
 
-def Run(cmd: string): dict<any>
+# Run comands on a shell and capture the output
+def RunShell(cmd: string): dict<any>
     var out = systemlist(cmd .. ' 2>&1')
     return {ok: v:shell_error == 0, lines: out}
 enddef
 
+
+# Spawn a buffer meant for failed command output
 def ErrorBuf(header: string, lines: list<string>)
     botright :15new
     setlocal buftype=nofile bufhidden=wipe nobuflisted noswapfile
-    silent! execute 'file PRFix\ Errors'
+    silent! execute 'filename PRFix\ Errors'
     setline(1, [header, repeat('─', 60), ''] + lines)
     setlocal nomodifiable
 enddef
+
 
 def Truncate(s: string, n: number): string
     return len(s) > n ? s[: n - 4] .. '...' : s
@@ -38,33 +41,32 @@ def QfIdx(): number
     return -1
 enddef
 
-# ── Entry point ────────────────────────────────────────────────────────────────
 
-export def Start()
+export def GitStart(): number
     # 1. Git repo check
-    var r = Run('git rev-parse --is-inside-work-tree')
+    var r = RunShell('git rev-parse --is-inside-work-tree')
     if !r.ok
         ErrorBuf('[PRFix] Not inside a git repository', r.lines)
-        return
+        return -1
     endif
 
     # 2. Fetch open PRs
-    r = Run('gh pr list --json number,title,headRefName')
+    r = RunShell('gh pr list --json number,title,headRefName')
     if !r.ok
         ErrorBuf('[PRFix] Failed to list pull requests', r.lines)
-        return
+        return -1
     endif
     var prs: list<dict<any>> = json_decode(join(r.lines, ''))
     if empty(prs)
         ErrorBuf('[PRFix] No open pull requests found', [])
-        return
+        return -1
     endif
 
     # 3. Default to PR whose branch matches HEAD
-    r = Run('git branch --show-current')
+    r = RunShell('git branch --show-current')
     if !r.ok
         ErrorBuf('[PRFix] Could not get current branch', r.lines)
-        return
+        return -1
     endif
     var cur_branch = r.lines[0]
 
@@ -89,22 +91,22 @@ export def Start()
     elseif sel >= 1 && sel <= len(prs)
         chosen_idx = sel - 1
     else
-        return
+        return -1
     endif
     var pr = prs[chosen_idx]
 
     # 5. Checkout — any failure is fatal, dump stderr
-    r = Run($'gh pr checkout {pr.number}')
+    r = RunShell($'gh pr checkout {pr.number}')
     if !r.ok
         ErrorBuf($'[PRFix] Failed to checkout PR #{pr.number}', r.lines)
-        return
+        return -1
     endif
 
     # 6. Fetch inline review comments
-    r = Run($'gh api repos/:owner/:repo/pulls/{pr.number}/comments')
+    r = RunShell($'gh api repos/:owner/:repo/pulls/{pr.number}/comments')
     if !r.ok
         ErrorBuf('[PRFix] Failed to fetch inline comments', r.lines)
-        return
+        return -1
     endif
     var raw: list<dict<any>> = json_decode(join(r.lines, ''))
     s_comments = raw->mapnew((_, item): dict<any> => ({
@@ -116,65 +118,74 @@ export def Start()
 
     if empty(s_comments)
         echo $'[PRFix] No inline comments for PR #{pr.number}.'
-        return
+        return -1
     endif
 
-    OpenLayout(pr.number)
+    return pr.number
 enddef
 
-# ── Layout ─────────────────────────────────────────────────────────────────────
 
-def OpenLayout(pr_number: number)
-    tabnew
+def SetupWindowWorktree(pr_number: number)
+    s_worktree_buf = bufnr('%')
+enddef
 
-    # Populate the quickfix list
+
+def SetupWindowQuickFix(pr_number: number)
+    s_qf_buf = bufnr('%')
+
     var items: list<dict<any>> = []
     for c in s_comments
         items->add({
             filename: c.filename,
-            lnum:     c.lnum,
-            text:     Truncate(split(c.text, "\n")[0], 72),
+            lnum: c.lnum,
+            text: Truncate(split(c.text, "\n")[0], 72),
         })
     endfor
     setqflist([], ' ', {title: $'PR #{pr_number}', items: items})
 
-    # QF window at the bottom (left panel)
-    botright copen 12
-    s_qf_buf = bufnr('%')
+    matchadd('PRFixFixed', '.*\[x\].*')
 
-    # Highlight for marked-as-fixed entries
-    hi PrfixDone gui=strikethrough cterm=strikethrough guifg=#777777 ctermfg=8
-    matchadd('PrfixDone', '.*\[x\].*')
-
-    execute $'autocmd BufUnload <buffer={s_qf_buf}> ++once prfix#Cleanup()'
-
-    # Comment preview — vertical split to the right of QF
-    vertical rightbelow new
-    s_comment_buf = bufnr('%')
-    setlocal buftype=nofile bufhidden=wipe nobuflisted noswapfile wrap
-    silent! execute 'file PR\ Comment'
-    setlocal nomodifiable
-
-    wincmd h   # back to QF
-
+    # Add hook to update comment when quickfix window moves
     augroup PrfixSession
         autocmd!
-        autocmd CursorMoved * prfix#UpdatePreview()
-        autocmd BufWinEnter * prfix#UpdateGhostText()
+        autocmd CursorMoved * prfix#UpdateWindowComment()
     augroup END
 
-    # Global mappings active for the duration of the session
-    nnoremap <silent> <leader>pf <ScriptCmd>prfix#MarkFixed()<CR>
-    nnoremap <silent> <leader>ps <ScriptCmd>prfix#ApplySuggestion()<CR>
-
+    # Set to disable the previous hook until further things happen
     s_last_idx = -1
-    UpdatePreview()
+enddef
+
+
+def SetupWindowComments(pr_number: number)
+    s_comment_buf = bufnr('%')
+
+    setlocal buftype=nofile bufhidden=wipe nobuflisted noswapfile wrap
+    silent! execute 'filename PR\ Comment'
+    setlocal nomodifiable
+enddef
+
+
+# TODO There should be a way to recover if one does ^Wo
+def CreateWindows(pr_number: number)
+    # Set up the three windows of the user interface
+    tabnew
+    SetupWindowWorktree(pr_number)
+
+    botright copen 12
+    SetupWindowQuickFix(pr_number)
+
+    vertical rightbelow new
+    SetupWindowComments(pr_number)
+
+
+    # Back to QF window, then jump to first item in quickfix list
+    # This will take the cursor to Worktree window and refresh it
+    wincmd h
     silent! cc 1
 enddef
 
-# ── Preview panel ──────────────────────────────────────────────────────────────
 
-export def UpdatePreview()
+export def UpdateWindowComment()
     if s_comment_buf < 0 | return | endif
 
     var idx = QfIdx()
@@ -190,56 +201,6 @@ export def UpdatePreview()
     setbufvar(s_comment_buf, '&modifiable', 0)
 enddef
 
-# ── Ghost text ─────────────────────────────────────────────────────────────────
-
-def EnsurePropType()
-    # prop_type_add() errors if the type already exists, so guard with a check.
-    if prop_type_get('prfix_ghost') == {}
-        prop_type_add('prfix_ghost', {highlight: 'PrfixGhost'})
-        hi PrfixGhost ctermfg=238 guifg=#606060 gui=italic cterm=italic
-    endif
-    if prop_type_get('prfix_replaced') == {}
-        prop_type_add('prfix_replaced', {highlight: 'PrfixGhost'})
-    endif
-enddef
-
-export def UpdateGhostText()
-    if empty(s_comments) | return | endif
-
-    EnsurePropType()
-
-    var buf = bufnr('%')
-    var rel = fnamemodify(bufname(buf), ':.')
-
-    # Join with the preceding undo block so that pressing u does not jump the
-    # cursor to line 1. silent! absorbs E790 when there is nothing to join.
-    silent! undojoin
-
-    # Wipe all existing annotations then redraw so edits don't leave stale markers.
-    prop_remove({type: 'prfix_ghost', bufnr: buf, all: true}, 1, line('$'))
-
-    for c in s_comments
-        if c.filename != rel | continue | endif
-        var lnum = c.lnum
-        if lnum < 1 || lnum > line('$') | continue | endif
-        var pad = repeat(' ', max([1, 80 - strdisplaywidth(getline(lnum))]))
-        prop_add(lnum, 0, {
-            bufnr:      buf,
-            type:       'prfix_ghost',
-            text:       pad .. '<-- change requested',
-            text_align: 'after',
-        })
-    endfor
-
-    # Register per-buffer autocmds so ghost text refreshes on every edit,
-    # matching the vim-slidev pattern.
-    augroup PrfixGhost
-        autocmd! * <buffer>
-        autocmd TextChanged,TextChangedI,BufWritePost,VimResized <buffer> prfix#UpdateGhostText()
-    augroup END
-enddef
-
-# ── Mark as fixed ──────────────────────────────────────────────────────────────
 
 export def MarkFixed()
     if s_qf_buf < 0 | return | endif
@@ -254,7 +215,6 @@ export def MarkFixed()
     setqflist(qf, 'r')
 enddef
 
-# ── Apply suggestion ───────────────────────────────────────────────────────────
 
 export def ApplySuggestion()
     if s_qf_buf < 0 | return | endif
@@ -282,19 +242,8 @@ export def ApplySuggestion()
     var top = lnum - n + 1
     var bot = lnum
     execute $'normal! {top}GV{bot}G'
-
-    # Ghost *** on the displaced original lines (cleared on next edit)
-    if prop_type_get('prfix_replaced') != {}
-        for i in range(n)
-            prop_add(lnum + i + 1, 1, {
-                bufnr:      buf,
-                type:       'prfix_replaced',
-                text:       ' ***',
-                text_align: 'after',
-            })
-        endfor
-    endif
 enddef
+
 
 def ParseSuggestion(body: string): list<string>
     var result: list<string> = []
@@ -311,8 +260,25 @@ def ParseSuggestion(body: string): list<string>
     return result
 enddef
 
-# ── Cleanup ────────────────────────────────────────────────────────────────────
 
+export def Start()
+    highlight PRFixFixed gui=strikethrough cterm=strikethrough guifg=#777777 ctermfg=8
+
+    var pr_number = GitStart()
+    if pr_number == -1
+        return
+    endif
+
+    CreateWindows(pr_number)
+
+    # Global mappings active for the duration of the session
+    nnoremap <silent> <leader>pf <ScriptCmd>prfix#MarkFixed()<CR>
+    nnoremap <silent> <leader>ps <ScriptCmd>prfix#ApplySuggestion()<CR>
+
+enddef
+
+
+# TODO
 export def Cleanup()
     augroup PrfixSession
         autocmd!
@@ -324,13 +290,8 @@ export def Cleanup()
     silent! nunmap <leader>ps
     s_comments    = []
     s_marked      = []
+    s_worktree_buf = -1
     s_comment_buf = -1
     s_qf_buf      = -1
     s_last_idx    = -1
-    if prop_type_get('prfix_ghost') != {}
-        silent! prop_type_delete('prfix_ghost')
-    endif
-    if prop_type_get('prfix_replaced') != {}
-        silent! prop_type_delete('prfix_replaced')
-    endif
 enddef
