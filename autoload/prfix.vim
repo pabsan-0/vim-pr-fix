@@ -6,7 +6,6 @@ var s_marked:      list<bool>      = []
 var s_comment_buf: number          = -1
 var s_qf_buf:      number          = -1
 var s_last_idx:    number          = -1
-var s_prop_ready:  bool            = false
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -161,7 +160,7 @@ def OpenLayout(pr_number: number)
     augroup PrfixSession
         autocmd!
         autocmd CursorMoved * prfix#UpdatePreview()
-        autocmd BufWinEnter * prfix#AddGhostText()
+        autocmd BufWinEnter * prfix#UpdateGhostText()
     augroup END
 
     # Global mappings active for the duration of the session
@@ -193,22 +192,31 @@ enddef
 
 # ── Ghost text ─────────────────────────────────────────────────────────────────
 
-export def AddGhostText()
+def EnsurePropType()
+    # prop_type_add() errors if the type already exists, so guard with a check.
+    if prop_type_get('prfix_ghost') == {}
+        prop_type_add('prfix_ghost', {highlight: 'PrfixGhost'})
+        hi PrfixGhost ctermfg=238 guifg=#606060 gui=italic cterm=italic
+    endif
+    if prop_type_get('prfix_replaced') == {}
+        prop_type_add('prfix_replaced', {highlight: 'PrfixGhost'})
+    endif
+enddef
+
+export def UpdateGhostText()
     if empty(s_comments) | return | endif
 
-    if !s_prop_ready
-        prop_type_add('prfix_ghost',    {highlight: 'PrfixGhost'})
-        prop_type_add('prfix_replaced', {highlight: 'PrfixGhost'})
-        hi PrfixGhost ctermfg=238 guifg=#606060 gui=italic cterm=italic
-        s_prop_ready = true
-    endif
+    EnsurePropType()
 
     var buf = bufnr('%')
     var rel = fnamemodify(bufname(buf), ':.')
 
-    # Refresh: clear all ghost annotations for this buffer then re-add
-    prop_remove({type: 'prfix_ghost',    bufnr: buf, all: true})
-    prop_remove({type: 'prfix_replaced', bufnr: buf, all: true})
+    # Join with the preceding undo block so that pressing u does not jump the
+    # cursor to line 1. silent! absorbs E790 when there is nothing to join.
+    silent! undojoin
+
+    # Wipe all existing annotations then redraw so edits don't leave stale markers.
+    prop_remove({type: 'prfix_ghost', bufnr: buf, all: true}, 1, line('$'))
 
     for c in s_comments
         if c.filename != rel | continue | endif
@@ -222,6 +230,13 @@ export def AddGhostText()
             text_align: 'after',
         })
     endfor
+
+    # Register per-buffer autocmds so ghost text refreshes on every edit,
+    # matching the vim-slidev pattern.
+    augroup PrfixGhost
+        autocmd! * <buffer>
+        autocmd TextChanged,TextChangedI,BufWritePost,VimResized <buffer> prfix#UpdateGhostText()
+    augroup END
 enddef
 
 # ── Mark as fixed ──────────────────────────────────────────────────────────────
@@ -268,8 +283,8 @@ export def ApplySuggestion()
     var bot = lnum
     execute $'normal! {top}GV{bot}G'
 
-    # Ghost *** on the displaced original lines (cleared on next BufWinEnter)
-    if s_prop_ready
+    # Ghost *** on the displaced original lines (cleared on next edit)
+    if prop_type_get('prfix_replaced') != {}
         for i in range(n)
             prop_add(lnum + i + 1, 1, {
                 bufnr:      buf,
@@ -302,6 +317,9 @@ export def Cleanup()
     augroup PrfixSession
         autocmd!
     augroup END
+    augroup PrfixGhost
+        autocmd!
+    augroup END
     silent! nunmap <leader>pf
     silent! nunmap <leader>ps
     s_comments    = []
@@ -309,9 +327,10 @@ export def Cleanup()
     s_comment_buf = -1
     s_qf_buf      = -1
     s_last_idx    = -1
-    if s_prop_ready
+    if prop_type_get('prfix_ghost') != {}
         silent! prop_type_delete('prfix_ghost')
+    endif
+    if prop_type_get('prfix_replaced') != {}
         silent! prop_type_delete('prfix_replaced')
-        s_prop_ready  = false
     endif
 enddef
