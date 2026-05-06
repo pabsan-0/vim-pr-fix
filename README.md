@@ -12,7 +12,7 @@ through every review note without leaving your editor.
 - **Interactive PR selection** at startup with smart default (current branch)
 - **Three-pane layout** in a new tab: source, quickfix list, comment preview
 - **Live comment preview** — moves as you navigate the quickfix list or use `:cnext` / `:cprev`
-- **Apply suggestions** — insert ` ```suggestion ` blocks as real text, visually selected for easy placement
+- **Apply suggestions** — insert ` ```suggestion ` blocks in-place, visually selected for easy placement
 - **Mark as fixed** — flag quickfix entries with `[x]` and strikethrough styling
 - **Ghost text** — `<-- change requested` annotation at column 80 on each commented line
 - **Error buffer** — any startup failure dumps full CLI output into a scratch buffer
@@ -23,9 +23,6 @@ through every review note without leaving your editor.
 - [`gh` GitHub CLI](https://cli.github.com) — authenticated
 - `git` available in `$PATH`
 - [vim-gitgutter](https://github.com/airblade/vim-gitgutter) recommended (shows which lines have been modified)
-
-Ghost text additionally requires Vim >= 9.0.0067. The plugin loads and works
-fully without it; only the inline annotations are suppressed.
 
 ## Installation
 
@@ -38,7 +35,7 @@ Or manually, clone into `~/.vim/pack/plugins/start/vim-pr-fix`.
 
 ## Usage
 
-Run `:PRfix` from any buffer inside a git repository. The plugin will:
+Run `:PRFix` from any buffer inside a git repository. The plugin will:
 
 1. Verify you are inside a git repository
 2. Fetch open pull requests with `gh pr list`
@@ -51,18 +48,24 @@ If any step fails, a scratch buffer opens with the error details.
 
 ## Mappings
 
-All mappings are buffer-local and active only in the quickfix window opened by `:PRfix`.
+These mappings are active globally during a PRFix session and work from any
+window — the source file, the quickfix list, or anywhere else.
 
 | Mapping | Action |
 |---|---|
-| `<leader>x` | Mark the current entry as fixed (`[x]` prefix + strikethrough) |
-| `<leader>s` | Insert the ` ```suggestion ` block below the target line, visually selected |
+| `<leader>pf` | Mark the current QF entry as fixed (`[x]` prefix + strikethrough) |
+| `<leader>ps` | Insert the ` ```suggestion ` block in-place, visually selected |
+
+When applying a suggestion, the inserted lines are visually selected so you
+can move (`gvd` / `gvp`) or delete (`gvd`) them. The displaced original lines
+receive a ` ***` ghost-text marker that clears the next time the buffer is
+entered.
 
 ## Commands
 
 | Command | Action |
 |---|---|
-| `:PRfix` | Start a PR review session |
+| `:PRFix` | Start a PR review session |
 
 ## Ghost text
 
@@ -73,9 +76,7 @@ a virtual-text marker at column 80:
 some code here                                              <-- change requested
 ```
 
-This requires **Vim >= 9.0.0067**. On older builds a one-time warning is
-printed and the plugin continues to work without annotations. Use
-vim-gitgutter to see which lines you have actually changed.
+Use vim-gitgutter to see which lines you have actually changed.
 
 ## Help
 

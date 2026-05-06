@@ -16,7 +16,7 @@ def Run(cmd: string): dict<any>
 enddef
 
 def ErrorBuf(header: string, lines: list<string>)
-    botright 15new
+    botright :15new
     setlocal buftype=nofile bufhidden=wipe nobuflisted noswapfile
     silent! execute 'file PRFix\ Errors'
     setline(1, [header, repeat('─', 60), ''] + lines)
@@ -27,32 +27,44 @@ def Truncate(s: string, n: number): string
     return len(s) > n ? s[: n - 4] .. '...' : s
 enddef
 
+# Return the 0-based index of the current QF item from any window.
+def QfIdx(): number
+    if bufnr('%') == s_qf_buf
+        return line('.') - 1
+    endif
+    var info = getqflist({idx: 0})
+    if type(info) == v:t_dict && has_key(info, 'idx') && info.idx > 0
+        return info.idx - 1
+    endif
+    return -1
+enddef
+
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 export def Start()
     # 1. Git repo check
     var r = Run('git rev-parse --is-inside-work-tree')
     if !r.ok
-        ErrorBuf('[prfix] Not inside a git repository', r.lines)
+        ErrorBuf('[PRFix] Not inside a git repository', r.lines)
         return
     endif
 
     # 2. Fetch open PRs
     r = Run('gh pr list --json number,title,headRefName')
     if !r.ok
-        ErrorBuf('[prfix] Failed to list pull requests', r.lines)
+        ErrorBuf('[PRFix] Failed to list pull requests', r.lines)
         return
     endif
     var prs: list<dict<any>> = json_decode(join(r.lines, ''))
     if empty(prs)
-        ErrorBuf('[prfix] No open pull requests found', [])
+        ErrorBuf('[PRFix] No open pull requests found', [])
         return
     endif
 
     # 3. Default to PR whose branch matches HEAD
     r = Run('git branch --show-current')
     if !r.ok
-        ErrorBuf('[prfix] Could not get current branch', r.lines)
+        ErrorBuf('[PRFix] Could not get current branch', r.lines)
         return
     endif
     var cur_branch = r.lines[0]
@@ -85,14 +97,14 @@ export def Start()
     # 5. Checkout — any failure is fatal, dump stderr
     r = Run($'gh pr checkout {pr.number}')
     if !r.ok
-        ErrorBuf($'[prfix] Failed to checkout PR #{pr.number}', r.lines)
+        ErrorBuf($'[PRFix] Failed to checkout PR #{pr.number}', r.lines)
         return
     endif
 
     # 6. Fetch inline review comments
     r = Run($'gh api repos/:owner/:repo/pulls/{pr.number}/comments')
     if !r.ok
-        ErrorBuf('[prfix] Failed to fetch inline comments', r.lines)
+        ErrorBuf('[PRFix] Failed to fetch inline comments', r.lines)
         return
     endif
     var raw: list<dict<any>> = json_decode(join(r.lines, ''))
@@ -104,7 +116,7 @@ export def Start()
     s_marked = repeat([false], len(s_comments))
 
     if empty(s_comments)
-        echo $'[prfix] No inline comments for PR #{pr.number}.'
+        echo $'[PRFix] No inline comments for PR #{pr.number}.'
         return
     endif
 
@@ -135,9 +147,6 @@ def OpenLayout(pr_number: number)
     hi PrfixDone gui=strikethrough cterm=strikethrough guifg=#777777 ctermfg=8
     matchadd('PrfixDone', '.*\[x\].*')
 
-    nnoremap <buffer><silent> <leader>x <ScriptCmd>prfix#MarkFixed()<CR>
-    nnoremap <buffer><silent> <leader>s <ScriptCmd>prfix#ApplySuggestion()<CR>
-
     execute $'autocmd BufUnload <buffer={s_qf_buf}> ++once prfix#Cleanup()'
 
     # Comment preview — vertical split to the right of QF
@@ -155,6 +164,10 @@ def OpenLayout(pr_number: number)
         autocmd BufWinEnter * prfix#AddGhostText()
     augroup END
 
+    # Global mappings active for the duration of the session
+    nnoremap <silent> <leader>pf <ScriptCmd>prfix#MarkFixed()<CR>
+    nnoremap <silent> <leader>ps <ScriptCmd>prfix#ApplySuggestion()<CR>
+
     s_last_idx = -1
     UpdatePreview()
     silent! cc 1
@@ -165,16 +178,7 @@ enddef
 export def UpdatePreview()
     if s_comment_buf < 0 | return | endif
 
-    var idx = -1
-    if bufnr('%') == s_qf_buf
-        idx = line('.') - 1
-    else
-        var info = getqflist({idx: 0})
-        if type(info) == v:t_dict && has_key(info, 'idx') && info.idx > 0
-            idx = info.idx - 1
-        endif
-    endif
-
+    var idx = QfIdx()
     if idx == s_last_idx || idx < 0 || idx >= len(s_comments)
         return
     endif
@@ -192,24 +196,18 @@ enddef
 export def AddGhostText()
     if empty(s_comments) | return | endif
 
-    if !has('patch-9.0.0067')
-        if !exists('g:prfix_ghost_warned')
-            g:prfix_ghost_warned = true
-            echohl WarningMsg
-            echom '[prfix] Ghost text requires Vim >= 9.0.0067 — annotation disabled'
-            echohl None
-        endif
-        return
-    endif
-
     if !s_prop_ready
-        prop_type_add('prfix_ghost', {highlight: 'PrfixGhost'})
+        prop_type_add('prfix_ghost',    {highlight: 'PrfixGhost'})
+        prop_type_add('prfix_replaced', {highlight: 'PrfixGhost'})
         hi PrfixGhost ctermfg=238 guifg=#606060 gui=italic cterm=italic
         s_prop_ready = true
     endif
 
     var buf = bufnr('%')
     var rel = fnamemodify(bufname(buf), ':.')
+
+    # Clear *** markers from a previous suggestion apply
+    prop_remove({type: 'prfix_replaced', bufnr: buf, all: true})
 
     for c in s_comments
         if c.filename != rel | continue | endif
@@ -231,39 +229,58 @@ enddef
 # ── Mark as fixed ──────────────────────────────────────────────────────────────
 
 export def MarkFixed()
-    var idx = line('.') - 1
+    if s_qf_buf < 0 | return | endif
+
+    var idx = QfIdx()
     if idx < 0 || idx >= len(s_comments) | return | endif
     if s_marked[idx] | return | endif
     s_marked[idx] = true
 
-    var qf   = getqflist()
+    var qf = getqflist()
     qf[idx].text = '[x] ' .. qf[idx].text
-    var save = line('.')
     setqflist(qf, 'r')
-    cursor(save, 1)
 enddef
 
 # ── Apply suggestion ───────────────────────────────────────────────────────────
 
 export def ApplySuggestion()
-    var idx = line('.') - 1
+    if s_qf_buf < 0 | return | endif
+
+    var idx = QfIdx()
     if idx < 0 || idx >= len(s_comments) | return | endif
 
     var suggestion = ParseSuggestion(s_comments[idx].text)
     if empty(suggestion)
-        echo '[prfix] No ```suggestion block in this comment.'
+        echo '[PRFix] No ```suggestion block in this comment.'
         return
     endif
 
+    # Jump to the relevant file/line
     execute $'cc {idx + 1}'
 
+    var buf  = bufnr('%')
     var lnum = s_comments[idx].lnum
-    append(lnum, suggestion)
+    var n    = len(suggestion)
 
-    # Leave block visually selected so gvd / gvp feel natural
-    var top = lnum + 1
-    var bot = lnum + len(suggestion)
+    # Insert the suggestion above the commented range so it lands in-place
+    append(lnum - n, suggestion)
+
+    # Visually select the inserted lines so gvd / gvp feel natural
+    var top = lnum - n + 1
+    var bot = lnum
     execute $'normal! {top}GV{bot}G'
+
+    # Ghost *** on the displaced original lines (cleared on next BufWinEnter)
+    if s_prop_ready
+        for i in range(n)
+            prop_add(lnum + i + 1, 1, {
+                bufnr:      buf,
+                type:       'prfix_replaced',
+                text:       ' ***',
+                text_align: 'after',
+            })
+        endfor
+    endif
 enddef
 
 def ParseSuggestion(body: string): list<string>
@@ -287,6 +304,8 @@ export def Cleanup()
     augroup PrfixSession
         autocmd!
     augroup END
+    silent! nunmap <leader>pf
+    silent! nunmap <leader>ps
     s_comments    = []
     s_marked      = []
     s_comment_buf = -1
@@ -294,6 +313,7 @@ export def Cleanup()
     s_last_idx    = -1
     if s_prop_ready
         silent! prop_type_delete('prfix_ghost')
+        silent! prop_type_delete('prfix_replaced')
         s_prop_ready  = false
     endif
 enddef

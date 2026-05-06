@@ -55,20 +55,22 @@ Moving the cursor inside the quickfix window, or navigating with `:cnext` /
 The following mappings are buffer-local and only active inside the quickfix
 window opened by |:PRfix|.
 
-    <leader>x   Mark the entry under the cursor as fixed.  The entry stays
+    <leader>pf  Mark the entry under the cursor as fixed.  The entry stays
                 in the list with a `[x]` prefix and strikethrough styling so
                 the session history is preserved.
 
-    <leader>s   Apply the ```suggestion block from the current comment.  The
-                suggested lines are inserted below the target line and
-                visually selected, making it easy to move them with `gvd` /
-                `gvp` or delete with `gvd`.  If the comment contains no
-                suggestion block a message is printed.
+    <leader>ps  Apply the ```suggestion block from the current comment.  The
+                suggested lines are inserted in place (above the original
+                commented range) and visually selected, making it easy to
+                move them with `gvd` / `gvp` or delete with `gvd`.  The
+                displaced original lines receive a ` ***` ghost-text marker
+                that clears the next time the buffer is entered.  If the
+                comment contains no suggestion block a message is printed.
 
 ==============================================================================
 5. COMMANDS                                                     *prfix-commands*
 
-*:PRfix*
+*:PRFix*
     Start a PR review session.  The startup sequence is:
 
         1. Verify the working directory is inside a git repository.
@@ -94,12 +96,9 @@ commented line: >
 The annotation is right-padded so it starts at column 80.  It is purely
 cosmetic — vim-gitgutter shows which lines have actually been edited.
 
-Ghost text requires Vim >= 9.0.0067 (text-property `text_align: after`
-support).  On older builds the plugin prints a one-time warning: >
-
-    [prfix] Ghost text requires Vim >= 9.0.0067 — annotation disabled
-<
-and continues to function normally without the annotations.
+When |<leader>ps| is used to apply a suggestion, the displaced original
+lines receive a ` ***` ghost-text marker to help locate them after the
+insertion.  These markers are cleared the next time the buffer is entered.
 
 ==============================================================================
 vim:ft=help:tw=78:
