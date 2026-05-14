@@ -135,10 +135,12 @@ def SetupWindowQuickFix(pr_number: number)
 
     var items: list<dict<any>> = []
     for c in s_comments
+        var num = c.lnum != null ? c.lnum : 0
+        # Truncate(split(c.text, "\n")[0], 72),
         items->add({
             filename: c.filename,
-            lnum: c.lnum,
-            text: Truncate(split(c.text, "\n")[0], 72),
+            lnum: num,
+            text: c.text,
         })
     endfor
     setqflist([], ' ', {title: $'PR #{pr_number}', items: items})
@@ -213,6 +215,8 @@ export def MarkFixed()
     var qf = getqflist()
     qf[idx].text = '[x] ' .. qf[idx].text
     setqflist(qf, 'r')
+
+    # TODO do not focus the first item on the qf after doing this
 enddef
 
 
