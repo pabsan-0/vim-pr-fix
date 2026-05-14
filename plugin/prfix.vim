@@ -5,4 +5,4 @@ if exists('g:loaded_prfix')
 endif
 g:loaded_prfix = true
 
-command! PRFix prfix#Start()
+command! PRFix prfix#Setup()
