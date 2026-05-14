@@ -1,0 +1,80 @@
+*prfix.txt*  Vim plugin for reviewing GitHub pull request comments
+
+==============================================================================
+CONTENTS                                                        *prfix-contents*
+
+    1. Introduction .............. |prfix-introduction|
+    2. Requirements .............. |prfix-requirements|
+    3. Layout .................... |prfix-layout|
+    4. Mappings .................. |prfix-mappings|
+    5. Commands .................. |prfix-commands|
+
+==============================================================================
+1. INTRODUCTION                                             *prfix-introduction*
+
+prfix.vim is a Vim9 plugin that turns an open GitHub pull request into an
+interactive review session.  It fetches inline review comments via the `gh`
+CLI, populates the quickfix list, and opens a three-pane layout so you can
+navigate each comment, preview its full body, and apply or mark it fixed —
+without leaving Vim.
+
+==============================================================================
+2. REQUIREMENTS                                             *prfix-requirements*
+
+    - Vim 9 (Vim9script)
+    - `git` available in $PATH
+    - `gh` GitHub CLI (https://cli.github.com) authenticated
+    - vim-gitgutter recommended (shows which lines have been modified)
+
+==============================================================================
+3. LAYOUT                                                       *prfix-layout*
+
+Running |:PRfix| opens a new tab with three panes:
+
+    ┌────────────────────────────────────────────────────────────┐
+    │                                                            │
+    │                   source file (top)                        │
+    │                                                            │
+    ├────────────────────────────┬───────────────────────────────┤
+    │  quickfix list (bottom-    │  comment preview (bottom-     │
+    │  left)  ── QF entries,     │  right)  ── full body of the  │
+    │  one per review comment    │  currently focused comment    │
+    └────────────────────────────┴───────────────────────────────┘
+
+Moving the cursor inside the quickfix window, or navigating with `:cnext` /
+`:cprev` in the source pane, updates the comment preview automatically.
+
+==============================================================================
+4. MAPPINGS                                                     *prfix-mappings*
+
+The following mappings are buffer-local and only active inside the quickfix
+window opened by |:PRfix|.
+
+    <leader>pf  Mark the entry under the cursor as fixed.  The entry stays
+                in the list with a `[x]` prefix and strikethrough styling so
+                the session history is preserved.
+
+    <leader>ps  Apply the ```suggestion block from the current comment.  The
+                suggested lines are inserted in place (above the original
+                commented range) and visually selected, making it easy to
+                move them with `gvd` / `gvp` or delete with `gvd`.
+
+==============================================================================
+5. COMMANDS                                                     *prfix-commands*
+
+*:PRFix*
+    Start a PR review session.  The startup sequence is:
+
+        1. Verify the working directory is inside a git repository.
+        2. Fetch the list of open pull requests via `gh pr list`.
+        3. Prompt you to select a PR; the one whose branch matches the
+           current HEAD branch is pre-selected (marked with `*`).
+        4. Check out the selected PR with `gh pr checkout`.
+        5. Fetch inline review comments from the GitHub API.
+        6. Open the three-pane review layout in a new tab.
+
+    If any step fails, a scratch buffer is opened showing the error header
+    and the full command output so the problem is easy to diagnose.
+
+==============================================================================
+vim:ft=help:tw=78:
