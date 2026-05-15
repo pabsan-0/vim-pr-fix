@@ -284,7 +284,12 @@ def PopulateQF()
                .. '  ' .. s_ctx.owner .. '/' .. s_ctx.repo,
         items: s_qf_items,
     })
-    SetupQFSync()
+
+    # After any :cc/:cn/:cp/:cfile etc., sync the PR buffer.
+    augroup PRCommentQFPost
+        autocmd!
+        autocmd QuickFixCmdPost * SyncPRCursor(getqflist({idx: 0}).idx)
+    augroup END
 enddef
 
 # ============================================================
@@ -298,35 +303,29 @@ enddef
 # 5. Either way, sync the PR buffer cursor to the qf entry's line.
 # ============================================================
 
-# TODO just use :cc along with the mapping s_lnum_to_qf
-# Then have the Quickfix AutoCmds do the highlighting and everything else
-def PREnter()
-    const saved   = getcurpos()
-    const found   = search('^  ●', 'bcnW')
+def PRHistoryBufferOnKeyEnter()
+    # Save current location to reset position if needed
+    const saved = getcurpos()
+    const pr_hist_buf = bufnr()
 
+    # Seek back for a line with an inline comment
+    const found = search('^  ●', 'bcnW')
     if found == 0
         return
     endif
 
-    const key = string(found)
-    if !has_key(s_lnum_to_qf, key)
+    # Check for QF existence and jump using cc
+    const lnum = string(found)
+    if !has_key(s_lnum_to_qf, lnum)
         return
     endif
+    execute 'cc ' .. s_lnum_to_qf[lnum]
 
-    const idx     = s_lnum_to_qf[key]
-    const pre_buf = bufnr()               # snapshot the buffer, not the window
-
-    execute 'cc ' .. idx
-
-    if bufnr() == pre_buf
-        # :cc didn't open a file (invalid entry) — restore and bail
+    # If :cc didn't open a file (invalid entry) — restore and bail
+    if bufnr() == pr_hist_buf
         setpos('.', saved)
         return
     endif
-
-    # We are now in the file buffer; :cc already placed the cursor correctly.
-    # Just sync the PR buffer's own cursor to the matching header line.
-    SyncPRCursor(idx)
 enddef
 
 # ============================================================
@@ -334,6 +333,7 @@ enddef
 # ============================================================
 
 # Move the PR buffer's cursor to the header line for qf entry `idx`.
+# TODO Quickfix event
 def SyncPRCursor(idx: number)
     if !has_key(s_qf_to_lnum, string(idx))
         return
@@ -346,37 +346,6 @@ def SyncPRCursor(idx: number)
     win_execute(win_getid(pr_win), 'normal! ' .. pr_lnum .. 'Gzz')
 enddef
 
-def SetupQFSync()
-    # After any :cc/:cn/:cp/:cfile etc., sync the PR buffer.
-    augroup PRCommentQFPost
-        autocmd!
-        autocmd QuickFixCmdPost * SyncPRCursor(getqflist({idx: 0}).idx)
-    augroup END
-
-    # Whenever a qf window opens (or its filetype is set), install
-    # buffer-local mappings and a CursorMoved autocmd inside it.
-    augroup PRCommentQFWindow
-        autocmd!
-        autocmd FileType qf SetupQFWindowMappings()
-    augroup END
-enddef
-
-# Runs inside the qf window's context (triggered by FileType qf).
-def SetupQFWindowMappings()
-    # <CR> in qf: jump to file AND sync the PR buffer cursor.
-    nnoremap <buffer> <CR> <ScriptCmd>QFJump()<CR>
-
-    # Live sync as the cursor moves through the qf list.
-    autocmd CursorMoved <buffer> SyncPRCursor(line('.'))
-enddef
-
-# Jump to the qf entry under the cursor (qf line == qf index here).
-def QFJump()
-    const idx = line('.')
-    execute 'cc ' .. idx
-    SyncPRCursor(idx)
-enddef
-
 # ============================================================
 # PR buffer mappings
 # ============================================================
@@ -385,7 +354,7 @@ enddef
 def SetupMappings(bufnr: number)
     win_execute(
         win_getid(bufwinnr(bufnr)),
-        'nnoremap <buffer> <CR> <ScriptCmd>PREnter()<CR>'
+        'nnoremap <buffer> <CR> <ScriptCmd>PRHistoryBufferOnKeyEnter()<CR>'
     )
 enddef
 
@@ -463,3 +432,7 @@ enddef
 # TODO Add two-pane diff view to edit files with change context?
 # TODO Consider location list rather than quickfix?
 # TODO Quickfix events autocopy suggestion to p register
+
+# Quickfix events notes:
+# - Highlight the current item in PRHistoryBuffer
+# - Yank a possible suggestion to P register
