@@ -35,6 +35,10 @@ def AssertEnvironment(): bool
     return true
 enddef
 
+# ============================================================
+# GH API PR data fetching
+# ============================================================
+
 def FetchPRData(owner: string, repo: string, pr: number)
     s_ctx        = {owner: owner, repo: repo, pr: pr}
     s_raw        = {}
@@ -236,11 +240,13 @@ def RenderEvents(): list<string>
     return lines
 enddef
 
+
+
 # ============================================================
-# Buffer
+# PRHistoryBuffer
 # ============================================================
 
-def CreatePRHistoryBuffer(lines: list<string>)
+export def PRHistoryBufferCreate(lines: list<string>)
     const bufname = 'pr://' .. s_ctx.owner .. '/' .. s_ctx.repo
                     .. '/' .. s_ctx.pr
 
@@ -249,108 +255,47 @@ def CreatePRHistoryBuffer(lines: list<string>)
     if bufnr == -1
         bufnr = bufadd(bufname)
     endif
-    s_pr_bufnr = bufnr
 
     # Allocate and configure
     bufload(bufnr)
     setbufvar(bufnr, '&buftype',   'nofile')
     setbufvar(bufnr, '&bufhidden', 'hide')
     setbufvar(bufnr, '&swapfile',  0)
-    setbufvar(bufnr, '&filetype',  '')
+    setbufvar(bufnr, '&filetype',  'prhistory')
 
-    # Populate
-    deletebufline(bufnr, 1, '$')
-    setbufline(bufnr, 1, lines)
+    s_pr_bufnr = bufnr
 
-    # TODO move outside this function, one for creation, one for display
-    # If not shown (not in a window), open in split to the right
-    if bufwinnr(bufnr) == -1
-        execute 'rightbelow vertical sbuffer ' .. bufnr
-    endif
-
-    # Pre 9.2 locked window implementation
-    const winid = win_getid(bufwinnr(bufnr))
-    setwinvar(winid, 'pr_locked_bufnr', bufnr)
-
-    # TODO We'll do this when this is a plugin through filetype
-    # ApplySyntax(bufnr)
-    # setbufvar(bufnr, '&filetype',  'prcomment')
-
-    PopulateQF()
-
-    # TODO This goes to filetype and is handled automatically
-    SetupMappings(bufnr)
+    PRHistoryBufferLoadLines(lines)
+    PRHistoryBufferShow()
 enddef
 
-# ============================================================
-# Window Locking (Vim 9.0 Workaround)
-# ============================================================
+def PRHistoryBufferLoadLines(lines: list<string>)
+    deletebufline(s_pr_bufnr, 1, '$')
+    setbufline(s_pr_bufnr, 1, lines)
 
-def EnforceWinLock()
-    # If this window isn't tagged, or it still holds the correct buffer, do nothing.
-    if !exists('w:pr_locked_bufnr') || w:pr_locked_bufnr == bufnr()
-        return
-    endif
-
-    # We are in the PR window, but a different buffer just loaded!
-    const hijacked_buf = bufnr()
-    const pr_buf = w:pr_locked_bufnr
-
-    # Quietly restore the PR buffer in the current window
-    execute 'silent! buffer ' .. pr_buf
-
-    # Shift focus to the code window on the left
-    FocusCodeWindow()
-
-    # Open the target code buffer here instead
-    execute 'silent! buffer ' .. hijacked_buf
-enddef
-
-augroup PRWinLock
-    autocmd!
-    autocmd BufEnter * EnforceWinLock()
-augroup END
-
-# Attempt to move to the left window
-# If the window ID hasn't changed, we are the only window: Create a vertical split to the left.
-def FocusCodeWindow()
-    const pr_win = win_getid()
-    wincmd h
-    if win_getid() == pr_win
-        leftabove vsplit
-    endif
-enddef
-
-# ============================================================
-# Quickfix population
-# ============================================================
-
-def PopulateQF()
     setqflist([], 'r', {
         title: 'PR #' .. s_ctx.pr
                .. '  ' .. s_ctx.owner .. '/' .. s_ctx.repo,
         items: s_qf_items,
     })
-
-    # After any :cc/:cn/:cp/:cfile etc., sync the PR buffer.
-    augroup PRCommentQFPost
-        autocmd!
-        autocmd User QuickFixJumpPost SyncPRCursor(getqflist({idx: 0}).idx)
-    augroup END
 enddef
 
-# ============================================================
-# <CR> in the PR buffer
-#
-# 1. Save position.
-# 2. Search backwards for the nearest ● header line.
-# 3. If that line has a qf entry, jump to it (opens the file).
-# 4. If we didn't leave the PR buffer (no valid file target),
-#    restore the cursor.
-# 5. Either way, sync the PR buffer cursor to the qf entry's line.
-# ============================================================
+def PRHistoryBufferShow()
+    # If not shown (not in a window), open in split to the right
+    if bufwinnr(s_pr_bufnr) == -1
+        execute 'rightbelow vertical sbuffer ' .. s_pr_bufnr
+    endif
 
-def PRHistoryBufferOnKeyEnter()
+    # Pre 9.2 locked window implementation
+    # Buffer needs to be visible when setting this
+    setwinvar(bufwinid(s_pr_bufnr), 'pr_locked_bufnr', s_pr_bufnr)
+enddef
+
+export def PRHistoryBufferHide()
+    # TODO
+enddef
+
+export def PRHistoryBufferOnKeyEnter()
     # Save current location to reset position if needed
     const saved = getcurpos()
     const pr_hist_buf = bufnr()
@@ -369,7 +314,7 @@ def PRHistoryBufferOnKeyEnter()
     const qf_idx = s_lnum_to_qf[lnum]
 
     # Move to the left window BEFORE executing the jump
-    FocusCodeWindow()
+    FocusWindowLeft()
 
     # Execute jump in the code window
     execute 'cc ' .. qf_idx
@@ -381,40 +326,32 @@ def PRHistoryBufferOnKeyEnter()
     endif
 enddef
 
-# ============================================================
-# QF → PR buffer sync
-# ============================================================
+def PRHistoryBufferOnQuickFixJump()
+    const curr_qf_idx = getqflist({idx: 0}).idx
 
-# Move the PR buffer's cursor to the header line for qf entry `idx`.
-def SyncPRCursor(idx: number)
-    if !has_key(s_qf_to_lnum, string(idx))
-        return
+    # Focus current QF-related comment on PRHistory
+    const winid = bufwinid(s_pr_bufnr)
+    const pr_lnum = get(s_qf_to_lnum, string(curr_qf_idx), -1)
+    if winid != -1 && pr_lnum != -1
+        win_execute(winid, $'normal! {pr_lnum}Gzz')
     endif
 
-    const pr_lnum = s_qf_to_lnum[string(idx)]
-    const pr_window  = bufwinnr(s_pr_bufnr)
-
-    # if prhistbuffer not active, nothing to do
-    if pr_window == -1
-        return
-    endif
-
-    # Else, focus line belonging to QF and center it
-    win_execute(win_getid(pr_window), 'normal! ' .. pr_lnum .. 'Gzz')
+    # TODO parse suggestion and load to p register
 enddef
 
-# ============================================================
-# PR buffer mappings
-# ============================================================
+def PRHistoryBufferOnBufEnter()
+    # If we are in PRHistory and a different buffer loads,
+    # restore PRHistory and open the new buffer to the left
 
-# TODO Move this to an ftplugin to apply buffer-local special mappings
-def SetupMappings(bufnr: number)
-    const winid = win_getid(bufwinnr(bufnr))
+    # If this window isn't tagged, or it still holds the correct buffer, do nothing.
+    if !exists('w:pr_locked_bufnr') || w:pr_locked_bufnr == bufnr()
+        return
+    endif
 
-    # Trigger cc via enter
-    win_execute(winid, 'nnoremap <buffer> <CR> <ScriptCmd>PRHistoryBufferOnKeyEnter()<CR>')
-
-    # TODO buffer easier nav with C-n C-p
+    const newly_opened_buf = bufnr()
+    execute 'silent! buffer ' .. w:pr_locked_bufnr
+    FocusWindowLeft()
+    execute 'silent! buffer ' .. newly_opened_buf
 enddef
 
 # ============================================================
@@ -457,6 +394,16 @@ def PrefixBody(body: string, first_pfx: string, rest_pfx: string): list<string>
     return out
 enddef
 
+def FocusWindowLeft(create: bool = false)
+    # Attempt to move to the left window
+    # If the window ID hasn't changed, we are the only window: Create a vertical split to the left.
+    wincmd h
+
+    if win_getid() == bufwinid(s_pr_bufnr) && create == true
+        leftabove vsplit
+    endif
+enddef
+
 
 def LoadPullRequest(owner: string, repo: string, prnum: number)
     var r = AssertEnvironment()
@@ -467,7 +414,7 @@ def LoadPullRequest(owner: string, repo: string, prnum: number)
     FetchPRData(owner, repo, prnum)
 
     const lines = RenderEvents()
-    CreatePRHistoryBuffer(lines)
+    PRHistoryBufferCreate(lines)
 
     # EventsToPRFilesBuffer()
     # QuickfixPopulate()
@@ -482,6 +429,12 @@ enddef
 
 export def Setup()
     LoadPullRequest("pabsan-0", "vim-pr-fix", 2)
+
+    augroup PRHistoryAutoCmd
+        autocmd!
+        autocmd BufEnter * PRHistoryBufferOnBufEnter()
+        autocmd User QuickFixJumpPost PRHistoryBufferOnQuickFixJump()
+    augroup END
 enddef
 
 # TODO Add pr fetching and checking out
@@ -489,8 +442,7 @@ enddef
 # TODO Add plugin whistleblower
 # TODO Add a changed file list
 # TODO Add two-pane diff view to edit files with change context?
-# TODO Consider location list rather than quickfix?
-# TODO Quickfix events autocopy suggestion to p register
+# TODO Syntax ftplugin
 
 # Quickfix events notes:
 # - Highlight the current item in PRHistoryBuffer
