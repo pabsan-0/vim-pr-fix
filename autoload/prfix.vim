@@ -78,6 +78,7 @@ def FetchPRData(owner: string, repo: string, pr: number)
 
     # Dont like that it blocks, should be async
     # But user is expected to wait for this job, else no work to be done
+    echom "Fetching PR " .. owner .. '/' .. repo .. '/' pr
     while s_pending > 0
         sleep 50m
     endwhile
@@ -261,17 +262,63 @@ def CreatePRHistoryBuffer(lines: list<string>)
     deletebufline(bufnr, 1, '$')
     setbufline(bufnr, 1, lines)
 
+    # TODO move outside this function, one for creation, one for display
     # If not shown (not in a window), open in split to the right
     if bufwinnr(bufnr) == -1
         execute 'rightbelow vertical sbuffer ' .. bufnr
     endif
 
-    # TODO We'll do this when this is a plugin
+    # Pre 9.2 locked window implementation
+    const winid = win_getid(bufwinnr(bufnr))
+    setwinvar(winid, 'pr_locked_bufnr', bufnr)
+
+    # TODO We'll do this when this is a plugin through filetype
     # ApplySyntax(bufnr)
     # setbufvar(bufnr, '&filetype',  'prcomment')
 
     PopulateQF()
+
+    # TODO This goes to filetype and is handled automatically
     SetupMappings(bufnr)
+enddef
+
+# ============================================================
+# Window Locking (Vim 9.0 Workaround)
+# ============================================================
+
+def EnforceWinLock()
+    # If this window isn't tagged, or it still holds the correct buffer, do nothing.
+    if !exists('w:pr_locked_bufnr') || w:pr_locked_bufnr == bufnr()
+        return
+    endif
+
+    # We are in the PR window, but a different buffer just loaded!
+    const hijacked_buf = bufnr()
+    const pr_buf = w:pr_locked_bufnr
+
+    # Quietly restore the PR buffer in the current window
+    execute 'silent! buffer ' .. pr_buf
+
+    # Shift focus to the code window on the left
+    FocusCodeWindow()
+
+    # Open the target code buffer here instead
+    execute 'silent! buffer ' .. hijacked_buf
+enddef
+
+augroup PRWinLock
+    autocmd!
+    autocmd BufEnter * EnforceWinLock()
+augroup END
+
+# Attempt to move to the left window
+# If the window ID hasn't changed, we are the only window: Create a vertical split to the left.
+def FocusCodeWindow()
+    const pr_win = win_getid()
+    wincmd h
+    if win_getid() == pr_win
+        leftabove vsplit
+    endif
 enddef
 
 # ============================================================
@@ -288,7 +335,7 @@ def PopulateQF()
     # After any :cc/:cn/:cp/:cfile etc., sync the PR buffer.
     augroup PRCommentQFPost
         autocmd!
-        autocmd QuickFixCmdPost * SyncPRCursor(getqflist({idx: 0}).idx)
+        autocmd User QuickFixJumpPost SyncPRCursor(getqflist({idx: 0}).idx)
     augroup END
 enddef
 
@@ -314,12 +361,18 @@ def PRHistoryBufferOnKeyEnter()
         return
     endif
 
-    # Check for QF existence and jump using cc
+    # Check for QF existence
     const lnum = string(found)
     if !has_key(s_lnum_to_qf, lnum)
         return
     endif
-    execute 'cc ' .. s_lnum_to_qf[lnum]
+    const qf_idx = s_lnum_to_qf[lnum]
+
+    # Move to the left window BEFORE executing the jump
+    FocusCodeWindow()
+
+    # Execute jump in the code window
+    execute 'cc ' .. qf_idx
 
     # If :cc didn't open a file (invalid entry) — restore and bail
     if bufnr() == pr_hist_buf
@@ -333,17 +386,21 @@ enddef
 # ============================================================
 
 # Move the PR buffer's cursor to the header line for qf entry `idx`.
-# TODO Quickfix event
 def SyncPRCursor(idx: number)
     if !has_key(s_qf_to_lnum, string(idx))
         return
     endif
+
     const pr_lnum = s_qf_to_lnum[string(idx)]
-    const pr_win  = bufwinnr(s_pr_bufnr)
-    if pr_win == -1
+    const pr_window  = bufwinnr(s_pr_bufnr)
+
+    # if prhistbuffer not active, nothing to do
+    if pr_window == -1
         return
     endif
-    win_execute(win_getid(pr_win), 'normal! ' .. pr_lnum .. 'Gzz')
+
+    # Else, focus line belonging to QF and center it
+    win_execute(win_getid(pr_window), 'normal! ' .. pr_lnum .. 'Gzz')
 enddef
 
 # ============================================================
@@ -352,10 +409,12 @@ enddef
 
 # TODO Move this to an ftplugin to apply buffer-local special mappings
 def SetupMappings(bufnr: number)
-    win_execute(
-        win_getid(bufwinnr(bufnr)),
-        'nnoremap <buffer> <CR> <ScriptCmd>PRHistoryBufferOnKeyEnter()<CR>'
-    )
+    const winid = win_getid(bufwinnr(bufnr))
+
+    # Trigger cc via enter
+    win_execute(winid, 'nnoremap <buffer> <CR> <ScriptCmd>PRHistoryBufferOnKeyEnter()<CR>')
+
+    # TODO buffer easier nav with C-n C-p
 enddef
 
 # ============================================================
