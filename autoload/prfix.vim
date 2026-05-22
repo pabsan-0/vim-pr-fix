@@ -20,15 +20,18 @@ const WIDTH = 72
 
 # ---- script-level state ------------------------------------
 
-var s_pending:    number          = 0
-var s_raw:        dict<string>    = {}
-var s_ctx:        dict<any>       = {}
-var s_pr_bufnr:   number          = -1
+var s_pending:          number          = 0
+var s_raw:              dict<string>    = {}
+var s_ctx:              dict<any>       = {}
+var s_pr_bufnr:         number          = -1
+var s_curr_suggestion:  list<string>    = []
 
 # Quickfix <-> PR-buffer line mappings (both keyed as strings)
-var s_qf_items:   list<dict<any>> = []
-var s_lnum_to_qf: dict<number>    = {}   # string(pr_buf_lnum) -> qf idx (1-based)
-var s_qf_to_lnum: dict<number>    = {}   # string(qf_idx)      -> pr_buf_lnum
+var s_qf_items:      list<dict<any>> = []
+var s_lnum_to_qf:    dict<number>    = {}   # string(pr_buf_lnum) -> qf idx (1-based)
+var s_qf_to_lnum:    dict<number>    = {}   # string(qf_idx)      -> pr_buf_lnum
+var s_qf_to_comment: dict<string>    = {}   # string(qf_idx)      -> parsed suggestion
+var s_qf_to_lcount:  dict<number>    = {}   # string(qf_idx)      -> parsed suggestion
 
 
 def AssertEnvironment(): bool
@@ -143,12 +146,20 @@ def RenderEvents(): list<string>
         const head    = threads[root][0]
         const replies = threads[root][1 : ]
         const lineno  = get(head, 'line', get(head, 'original_line', '?'))
+
+        const start_line = get(head, 'start_line', get(head, 'original_start_line', v:null))
+        var lcount = 1
+        if type(lineno) == v:t_number && type(start_line) == v:t_number
+            lcount = lineno - start_line + 1
+        endif
+
         events->add({
             kind:     'diff_thread',
             user:     head.user.login,
             body:     head.body,
             path:     head.path,
             lineno:   lineno,
+            lcount:   lcount,
             loc:      head.path .. '#L' .. lineno,
             outdated: get(head, 'position', v:null) == v:null,
             replies:  replies,
@@ -216,14 +227,14 @@ def RenderEvents(): list<string>
             })
             s_lnum_to_qf[string(pr_buf_lnum)] = qf_idx
             s_qf_to_lnum[string(qf_idx)]      = pr_buf_lnum
+            s_qf_to_comment[string(qf_idx)]   = e.body
+            s_qf_to_lcount[string(qf_idx)]    = e.lcount
 
             # Add lines for first comment, then all replies
             lines->add(RightAlign(
                 '  ●  ' .. e.user .. '  in ' .. e.loc .. tag, ts))
 
-            # TODO Do I really need the ┌ ?
-            const first_pfx = has_replies ? '  ┌  ' : '  │  '
-            lines += PrefixBody(e.body, first_pfx, '  │  ')
+            lines += PrefixBody(e.body, '  │  ', '  │  ')
 
             for reply in e.replies
                 const ts_reply = ShortDate(reply.created_at)
@@ -281,9 +292,16 @@ def PRHistoryBufferLoadLines(lines: list<string>)
 enddef
 
 def PRHistoryBufferShow()
+    if s_pr_bufnr == -1
+        return
+    endif
+
     # If not shown (not in a window), open in split to the right
     if bufwinnr(s_pr_bufnr) == -1
         execute 'rightbelow vertical sbuffer ' .. s_pr_bufnr
+
+        # Handles focusing the right qf entry
+        PRHistoryBufferOnQuickFixJump()
     endif
 
     # Pre 9.2 locked window implementation
@@ -291,8 +309,25 @@ def PRHistoryBufferShow()
     setwinvar(bufwinid(s_pr_bufnr), 'pr_locked_bufnr', s_pr_bufnr)
 enddef
 
-export def PRHistoryBufferHide()
-    # TODO
+def PRHistoryBufferHide()
+    if s_pr_bufnr == -1
+        return
+    endif
+
+    const winid = bufwinid(s_pr_bufnr)
+    if winid == -1
+        return
+    endif
+
+    win_execute(winid, 'close')
+enddef
+
+def PRHistoryBufferToggle()
+    if bufwinid(s_pr_bufnr) == -1
+        PRHistoryBufferShow()
+    else
+        PRHistoryBufferHide()
+    endif
 enddef
 
 export def PRHistoryBufferOnKeyEnter()
@@ -336,7 +371,7 @@ def PRHistoryBufferOnQuickFixJump()
         win_execute(winid, $'normal! {pr_lnum}Gzz')
     endif
 
-    # TODO parse suggestion and load to p register
+    CommentSuggestionToRegister(curr_qf_idx)
 enddef
 
 def PRHistoryBufferOnBufEnter()
@@ -396,14 +431,85 @@ enddef
 
 def FocusWindowLeft(create: bool = false)
     # Attempt to move to the left window
-    # If the window ID hasn't changed, we are the only window: Create a vertical split to the left.
     wincmd h
 
+    # If the window ID hasn't changed, we are the only window: Create a vertical split to the left.
     if win_getid() == bufwinid(s_pr_bufnr) && create == true
         leftabove vsplit
     endif
 enddef
 
+def CommentSuggestionToRegister(qf_item: number)
+    const comment = s_qf_to_comment[qf_item]
+
+    # Create an empty list to hold our target lines
+    var suggestion_lines = []
+    var in_suggestion = false
+
+    for line in split(comment, "\n")
+        if line == '```suggestion'
+            in_suggestion = true
+            continue
+        endif
+
+        if in_suggestion && line == '```'
+            in_suggestion = false
+            continue
+        endif
+
+        if in_suggestion
+            add(suggestion_lines, line)
+        endif
+    endfor
+
+    # Inject the list into register 'p' as a Linewise block ('V')
+    # This guarantees it will paste exactly as standard lines of code
+    setreg('p', suggestion_lines, 'V')
+    s_curr_suggestion = suggestion_lines
+enddef
+
+def CommentSelectLines()
+    const curr_qf_idx = getqflist({idx: 0}).idx
+
+    const lcount = s_qf_to_lcount[string(curr_qf_idx)]
+    execute 'cc ' .. curr_qf_idx
+
+    execute 'normal! V'
+    if lcount > 1
+        execute 'normal! ' .. (lcount - 1) .. 'k'
+    endif
+enddef
+
+def CommentApplySuggestion()
+    CommentSelectLines()
+    execute "normal! \<Esc>"
+
+    const top = line("'<")
+    const bottom = line("'>")
+    const old_lines_count = bottom - top + 1
+    const new_lines_count = len(s_curr_suggestion)
+
+    # Edge Case: The suggestion is a pure deletion
+    if new_lines_count == 0
+        execute top .. ',' .. bottom .. 'delete _'
+        return
+    endif
+
+    # To avoid mangling QF line numbers:
+    # Mutate the bottom line instead of deleting it, then delete old lines above,
+    # then insert new lines above (minus the one we setline'd already)
+    setline(bottom, s_curr_suggestion[-1])
+    if old_lines_count > 1
+        deletebufline('%', top, bottom - 1)
+    endif
+    if new_lines_count > 1
+        append(top - 1, s_curr_suggestion[0 : new_lines_count - 2])
+    endif
+enddef
+
+# ============================================================
+# Entrypoint
+# ============================================================
 
 def LoadPullRequest(owner: string, repo: string, prnum: number)
     var r = AssertEnvironment()
@@ -416,19 +522,14 @@ def LoadPullRequest(owner: string, repo: string, prnum: number)
     const lines = RenderEvents()
     PRHistoryBufferCreate(lines)
 
-    # EventsToPRFilesBuffer()
-    # QuickfixPopulate()
-    # These install commands to switch to/from diff view
-    # command!
-    # command!
-    # augroup QF
-    #     autocmd!
-    #     autocmd QuickFixCmdPost * QuickfixUpdateEvent()
-    # augroup
 enddef
 
 export def Setup()
     LoadPullRequest("pabsan-0", "vim-pr-fix", 2)
+
+    command! PRFixCommentSelectLines CommentSelectLines()
+    command! PRFixCommentApplySuggestion CommentApplySuggestion()
+    command! PRFixHistoryToggle PRHistoryBufferToggle()
 
     augroup PRHistoryAutoCmd
         autocmd!
@@ -438,12 +539,6 @@ export def Setup()
 enddef
 
 # TODO Add pr fetching and checking out
-# TODO Install a few mappings?
-# TODO Add plugin whistleblower
-# TODO Add a changed file list
-# TODO Add two-pane diff view to edit files with change context?
+# TODO Add a changed file list -> this can be done with fugitive Gvdiffsplit
+# TODO Add two-pane diff view to edit files with change context?-> this can be done with fugitive Gvdiffsplit
 # TODO Syntax ftplugin
-
-# Quickfix events notes:
-# - Highlight the current item in PRHistoryBuffer
-# - Yank a possible suggestion to P register
