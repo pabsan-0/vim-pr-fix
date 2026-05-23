@@ -445,7 +445,7 @@ def FocusWindowLeft(create: bool = false)
     endif
 enddef
 
-def GetTargetLines(path: string, top: number, bot: number): list<string>
+def FileReadLines(path: string, top: number, bot: number): list<string>
     const bnr = bufnr(path)
 
     if bnr != -1 && bufloaded(bnr)
@@ -470,6 +470,7 @@ def ParseSuggestionFromEvent(event: dict<any>): dict<any>
         lines: [],
         original_lines: [],
     }
+
     # Actual parsing
     var in_suggestion = false
     for line in split(event.body, "\n")
@@ -490,11 +491,15 @@ def ParseSuggestionFromEvent(event: dict<any>): dict<any>
     if suggestion.exists
         const bot = event.lineno
         const top = bot - event.linecount + 1
-        suggestion.original_lines = GetTargetLines(event.path, top, bot)
+        suggestion.original_lines = FileReadLines(event.path, top, bot)
     endif
 
     return suggestion
 enddef
+
+# ============================================================
+# User interface
+# ============================================================
 
 def CommentSelectLines(a_qf_idx: number = -1)
     var curr_qf_idx = a_qf_idx
@@ -503,7 +508,7 @@ def CommentSelectLines(a_qf_idx: number = -1)
     endif
 
     const lcount = s_qf_to_lcount[string(curr_qf_idx)]
-    execute 'cc ' .. curr_qf_idx
+    execute 'silent! cc ' .. curr_qf_idx
 
     execute 'normal! V'
     if lcount > 1
@@ -517,6 +522,7 @@ def CommentApplySuggestion(a_qf_idx: number = -1)
         curr_qf_idx = getqflist({idx: 0}).idx
     endif
 
+    # Assert comment carries a suggestion
     const suggestion = get(s_qf_to_suggestion, string(curr_qf_idx), {exists: false})
     if !suggestion.exists
         return
@@ -530,6 +536,7 @@ def CommentApplySuggestion(a_qf_idx: number = -1)
     const bot = qf_item.lnum
     const top = bot - old_lines_count + 1
 
+    # Verify user hasnt already modified content
     const current_lines = getbufline(target_bufnr, top, bot)
     if current_lines != suggestion.original_lines
         execute $'silent! cc {curr_qf_idx}'
@@ -591,6 +598,7 @@ enddef
 
 # THIS release
 # TODO Add pr fetching and checking out
+# TODO Open comment remote
 # TODO Syntax ftplugin
 
 # FUTURE
