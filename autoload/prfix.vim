@@ -20,18 +20,19 @@ const WIDTH = 72
 
 # ---- script-level state ------------------------------------
 
-var s_pending:          number          = 0
-var s_raw:              dict<string>    = {}
-var s_ctx:              dict<any>       = {}
-var s_pr_bufnr:         number          = -1
-var s_curr_suggestion:  list<string>    = []
+var s_pending:  number       = 0
+var s_raw:      dict<string> = {}
+var s_ctx:      dict<any>    = {}
+var s_pr_bufnr: number       = -1
+
 
 # Quickfix <-> PR-buffer line mappings (both keyed as strings)
-var s_qf_items:      list<dict<any>> = []
-var s_lnum_to_qf:    dict<number>    = {}   # string(pr_buf_lnum) -> qf idx (1-based)
-var s_qf_to_lnum:    dict<number>    = {}   # string(qf_idx)      -> pr_buf_lnum
-var s_qf_to_comment: dict<string>    = {}   # string(qf_idx)      -> parsed suggestion
-var s_qf_to_lcount:  dict<number>    = {}   # string(qf_idx)      -> parsed suggestion
+var s_qf_items:         list<dict<any>> = []
+var s_lnum_to_qf:       dict<number>    = {}   # string(pr_buf_lnum) -> qf idx (1-based)
+var s_qf_to_lnum:       dict<number>    = {}   # string(qf_idx)      -> pr_buf_lnum
+var s_qf_to_lcount:     dict<number>    = {}   # string(qf_idx)      -> qf entry number of lines
+var s_qf_to_comment:    dict<string>    = {}   # string(qf_idx)      -> qf entry comment
+var s_qf_to_suggestion: dict<dict<any>> = {}   # string(qf_idx)      -> qf entry suggestion object
 
 
 def AssertEnvironment(): bool
@@ -181,7 +182,7 @@ def RenderEvents(): list<string>
     # Notice that replies are surrogate, they dont get their own time-sorting
     events->sort((a, b) => a.time < b.time ? -1 : a.time > b.time ? 1 : 0)
 
-    # TODO clear function separation here -- split files too
+    # TODO clear function separation here
 
     # Build lines, recording qf positions as we go
     #
@@ -225,10 +226,11 @@ def RenderEvents(): list<string>
                 text:     '@' .. e.user .. '  ' .. e.loc
                           .. '  ' .. split(e.body, "\n")[0],
             })
-            s_lnum_to_qf[string(pr_buf_lnum)] = qf_idx
-            s_qf_to_lnum[string(qf_idx)]      = pr_buf_lnum
-            s_qf_to_comment[string(qf_idx)]   = e.body
-            s_qf_to_lcount[string(qf_idx)]    = e.lcount
+            s_lnum_to_qf[string(pr_buf_lnum)]  = qf_idx
+            s_qf_to_lnum[string(qf_idx)]       = pr_buf_lnum
+            s_qf_to_lcount[string(qf_idx)]     = e.lcount
+            s_qf_to_comment[string(qf_idx)]    = e.body
+            s_qf_to_suggestion[string(qf_idx)] = ParseSuggestionFromComment(e.body)
 
             # Add lines for first comment, then all replies
             lines->add(RightAlign(
@@ -371,7 +373,11 @@ def PRHistoryBufferOnQuickFixJump()
         win_execute(winid, $'normal! {pr_lnum}Gzz')
     endif
 
-    CommentSuggestionToRegister(curr_qf_idx)
+    # Inject the suggestion-lines-list into register 'p' as Linewise block ('V')
+    # This guarantees it will paste exactly as standard lines of code
+    # May be empty and purposefully blow the register
+    const suggestion = s_qf_to_suggestion[curr_qf_idx]
+    setreg('p', suggestion.lines, 'V')
 enddef
 
 def PRHistoryBufferOnBufEnter()
@@ -439,33 +445,29 @@ def FocusWindowLeft(create: bool = false)
     endif
 enddef
 
-def CommentSuggestionToRegister(qf_item: number)
-    const comment = s_qf_to_comment[qf_item]
+def ParseSuggestionFromComment(comment: string): dict<any>
+    var suggestion = {
+        exists: false,
+        lcount: 0,
+        lines: []
+    }
 
-    # Create an empty list to hold our target lines
-    var suggestion_lines = []
     var in_suggestion = false
-
     for line in split(comment, "\n")
         if line == '```suggestion'
             in_suggestion = true
             continue
-        endif
-
-        if in_suggestion && line == '```'
+        elseif in_suggestion && line == '```'
             in_suggestion = false
+            suggestion.exists = true
             continue
-        endif
-
-        if in_suggestion
-            add(suggestion_lines, line)
+        elseif in_suggestion
+            suggestion.lcount += 1
+            add(suggestion.lines, line)
         endif
     endfor
 
-    # Inject the list into register 'p' as a Linewise block ('V')
-    # This guarantees it will paste exactly as standard lines of code
-    setreg('p', suggestion_lines, 'V')
-    s_curr_suggestion = suggestion_lines
+    return suggestion
 enddef
 
 def CommentSelectLines()
@@ -481,29 +483,40 @@ def CommentSelectLines()
 enddef
 
 def CommentApplySuggestion()
+    const curr_qf_idx = getqflist({idx: 0}).idx
+    const suggestion = s_qf_to_suggestion[string(curr_qf_idx)]
+    if !suggestion.exists
+        return
+    endif
+
     CommentSelectLines()
     execute "normal! \<Esc>"
 
     const top = line("'<")
     const bottom = line("'>")
     const old_lines_count = bottom - top + 1
-    const new_lines_count = len(s_curr_suggestion)
 
     # Edge Case: The suggestion is a pure deletion
-    if new_lines_count == 0
+    if suggestion.lcount == 0
         execute top .. ',' .. bottom .. 'delete _'
         return
     endif
 
+    # FIXME What if we do this from PRHistoryBufer? Need a better way
+    # We could use this:
+    #   appendbufline(bufnr, lnum, lines)
+    #   deletebufline(bufnr, first, last)
+    # But still havent figured how to locate the buffer that needs changing
+
     # To avoid mangling QF line numbers:
     # Mutate the bottom line instead of deleting it, then delete old lines above,
     # then insert new lines above (minus the one we setline'd already)
-    setline(bottom, s_curr_suggestion[-1])
+    setline(bottom, suggestion.lines[-1])
     if old_lines_count > 1
         deletebufline('%', top, bottom - 1)
     endif
-    if new_lines_count > 1
-        append(top - 1, s_curr_suggestion[0 : new_lines_count - 2])
+    if suggestion.lcount > 1
+        append(top - 1, suggestion.lines[0 : suggestion.lcount - 2])
     endif
 enddef
 
@@ -531,6 +544,10 @@ export def Setup()
     command! PRFixCommentApplySuggestion CommentApplySuggestion()
     command! PRFixHistoryToggle PRHistoryBufferToggle()
 
+    # command! PRFixFiles
+    # command! PRFixBrowse
+    # command! PRFixQuit
+
     augroup PRHistoryAutoCmd
         autocmd!
         autocmd BufEnter * PRHistoryBufferOnBufEnter()
@@ -539,6 +556,7 @@ export def Setup()
 enddef
 
 # TODO Add pr fetching and checking out
+# TODO Add info function
 # TODO Add a changed file list -> this can be done with fugitive Gvdiffsplit
 # TODO Add two-pane diff view to edit files with change context?-> this can be done with fugitive Gvdiffsplit
 # TODO Syntax ftplugin
