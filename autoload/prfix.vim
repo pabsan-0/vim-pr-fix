@@ -24,6 +24,7 @@ var s_pending:  number       = 0
 var s_raw:      dict<string> = {}
 var s_ctx:      dict<any>    = {}
 var s_pr_bufnr: number       = -1
+var s_pr_url:   string       = ""
 
 
 # Quickfix <-> PR-buffer line mappings (both keyed as strings)
@@ -51,6 +52,7 @@ def FetchPRData(owner: string, repo: string, pr: number)
     s_qf_items   = []
     s_lnum_to_qf = {}
     s_qf_to_lnum = {}
+    s_pr_url     = $"https://github.com/{owner}/{repo}/pull/{pr}"
 
     const base = '/repos/' .. owner .. '/' .. repo
 
@@ -284,11 +286,12 @@ export def PRHistoryBufferCreate(lines: list<string>)
 
     s_pr_bufnr = bufnr
 
-    PRHistoryBufferLoadLines(lines)
+    PRHistoryBufferLoadLines(bufnr, lines)
     PRHistoryBufferShow()
 enddef
 
-def PRHistoryBufferLoadLines(lines: list<string>)
+def PRHistoryBufferLoadLines(bufnr: number, lines: list<string>)
+    setbufvar(bufnr, '&modifiable',  1)
     deletebufline(s_pr_bufnr, 1, '$')
     setbufline(s_pr_bufnr, 1, lines)
 
@@ -297,6 +300,7 @@ def PRHistoryBufferLoadLines(lines: list<string>)
                .. '  ' .. s_ctx.owner .. '/' .. s_ctx.repo,
         items: s_qf_items,
     })
+    setbufvar(bufnr, '&modifiable',  0)
 enddef
 
 def PRHistoryBufferShow()
@@ -338,22 +342,25 @@ def PRHistoryBufferToggle()
     endif
 enddef
 
+def PRHistoryBufferEventLineSeekBack(): number
+    const curr_lnum = line('.')
+
+    var closest_qf_line = -1
+    for lnum in keys(s_lnum_to_qf)->map((_, v) => str2nr(v))->sort('n')
+        if curr_lnum >= lnum
+            closest_qf_line = lnum
+        endif
+    endfor
+
+    return closest_qf_line
+enddef
+
 export def PRHistoryBufferOnKeyEnter()
     # Save current location to reset position if needed
     const saved = getcurpos()
     const pr_hist_buf = bufnr()
 
-    # Seek back for a line with an inline comment
-    const found = search('^  ●', 'bcnW')
-    if found == 0
-        return
-    endif
-
-    # Check for QF existence
-    const lnum = string(found)
-    if !has_key(s_lnum_to_qf, lnum)
-        return
-    endif
+    const lnum = PRHistoryBufferEventLineSeekBack()
     const qf_idx = s_lnum_to_qf[lnum]
 
     # Move to the left window BEFORE executing the jump
@@ -367,6 +374,16 @@ export def PRHistoryBufferOnKeyEnter()
         setpos('.', saved)
         return
     endif
+enddef
+
+export def PRHistoryBufferOnKeyo()
+    const lnum = PRHistoryBufferEventLineSeekBack()
+    const qf_idx = s_lnum_to_qf[lnum]
+    CommentBrowse(qf_idx)
+enddef
+
+export def PRHistoryBufferOnKeyO()
+    Browse()
 enddef
 
 def PRHistoryBufferOnQuickFixJump()
@@ -577,6 +594,10 @@ def CommentBrowse(a_qf_idx: number = -1)
     system("xdg-open " .. url .. " >/dev/null 2>&1")
 enddef
 
+def Browse()
+    system("xdg-open " .. s_pr_url .. " >/dev/null 2>&1")
+enddef
+
 # ============================================================
 # Entrypoint
 # ============================================================
@@ -600,10 +621,11 @@ export def Setup()
     command! -nargs=? PRFixCommentSelectLines     CommentSelectLines(<args>)
     command! -nargs=? PRFixCommentApplySuggestion CommentApplySuggestion(<args>)
     command! -nargs=? PRFixCommentBrowse          CommentBrowse(<args>)
+
     command! PRFixHistoryToggle PRHistoryBufferToggle()
+    command! PRFixBrowse        Browse()
 
     # command! PRFixFiles
-    # command! PRFixBrowse
     # command! PRFixQuit
 
     augroup PRHistoryAutoCmd
