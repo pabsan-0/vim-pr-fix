@@ -33,6 +33,7 @@ var s_qf_to_lnum:       dict<number>    = {}   # string(qf_idx)      -> pr_buf_l
 var s_qf_to_lcount:     dict<number>    = {}   # string(qf_idx)      -> qf entry number of lines
 var s_qf_to_comment:    dict<string>    = {}   # string(qf_idx)      -> qf entry comment
 var s_qf_to_suggestion: dict<dict<any>> = {}   # string(qf_idx)      -> qf entry suggestion object
+var s_qf_to_browse_url: dict<string>    = {}   # string(qf_idx)      -> qf entry suggestion object
 
 
 def AssertEnvironment(): bool
@@ -115,7 +116,8 @@ def RenderEvents(): list<string>
             kind: 'issue_comment',
             user: c.user.login,
             body: c.body,
-            time: c.created_at
+            time: c.created_at,
+            browse_url: c.html_url,
         })
     endfor
 
@@ -125,7 +127,8 @@ def RenderEvents(): list<string>
             user: r.user.login,
             body: get(r, 'body', ''),
             state: r.state,
-            time: r.submitted_at
+            time: r.submitted_at,
+            browse_url: r.html_url,
         })
     endfor
 
@@ -165,6 +168,7 @@ def RenderEvents(): list<string>
             outdated: get(head, 'position', v:null) == v:null,
             replies:  replies,
             time:     head.created_at,
+            browse_url: head.html_url,
         })
     endfor
 
@@ -175,6 +179,7 @@ def RenderEvents(): list<string>
             sha:  c.sha[ : 6],
             msg:  split(c.commit.message, "\n")[0],
             time: c.commit.author.date,
+            browse_url: c.html_url,
         })
     endfor
 
@@ -231,6 +236,7 @@ def RenderEvents(): list<string>
             s_qf_to_lcount[string(qf_idx)]     = e.linecount
             s_qf_to_comment[string(qf_idx)]    = e.body
             s_qf_to_suggestion[string(qf_idx)] = ParseSuggestionFromEvent(e)
+            s_qf_to_browse_url[string(qf_idx)] = e.browse_url
 
             # Add lines for first comment, then all replies
             lines->add(RightAlign(
@@ -561,6 +567,16 @@ def CommentApplySuggestion(a_qf_idx: number = -1)
     execute $'silent! cc {curr_qf_idx}'
 enddef
 
+def CommentBrowse(a_qf_idx: number = -1)
+    var curr_qf_idx = a_qf_idx
+    if curr_qf_idx == -1
+        curr_qf_idx = getqflist({idx: 0}).idx
+    endif
+
+    const url = s_qf_to_browse_url[string(curr_qf_idx)]
+    system("xdg-open " .. url .. " >/dev/null 2>&1")
+enddef
+
 # ============================================================
 # Entrypoint
 # ============================================================
@@ -583,6 +599,7 @@ export def Setup()
 
     command! -nargs=? PRFixCommentSelectLines     CommentSelectLines(<args>)
     command! -nargs=? PRFixCommentApplySuggestion CommentApplySuggestion(<args>)
+    command! -nargs=? PRFixCommentBrowse          CommentBrowse(<args>)
     command! PRFixHistoryToggle PRHistoryBufferToggle()
 
     # command! PRFixFiles
@@ -598,7 +615,6 @@ enddef
 
 # THIS release
 # TODO Add pr fetching and checking out
-# TODO Open comment remote
 # TODO Syntax ftplugin
 
 # FUTURE
@@ -607,3 +623,5 @@ enddef
 # TODO Add info function
 # TODO Need a visual hint on PRHistoryBuffer for the currently active entry
 # TODO Add ghost text to qf entries, both on PRHistory and Worktree
+# TODO Containerize to allow multiple PRs at once
+# TODO Allow changed files w.r. remote
