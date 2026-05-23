@@ -149,9 +149,9 @@ def RenderEvents(): list<string>
         const lineno  = get(head, 'line', get(head, 'original_line', '?'))
 
         const start_line = get(head, 'start_line', get(head, 'original_start_line', v:null))
-        var lcount = 1
+        var linecount = 1
         if type(lineno) == v:t_number && type(start_line) == v:t_number
-            lcount = lineno - start_line + 1
+            linecount = lineno - start_line + 1
         endif
 
         events->add({
@@ -160,7 +160,7 @@ def RenderEvents(): list<string>
             body:     head.body,
             path:     head.path,
             lineno:   lineno,
-            lcount:   lcount,
+            linecount:   linecount,
             loc:      head.path .. '#L' .. lineno,
             outdated: get(head, 'position', v:null) == v:null,
             replies:  replies,
@@ -228,9 +228,9 @@ def RenderEvents(): list<string>
             })
             s_lnum_to_qf[string(pr_buf_lnum)]  = qf_idx
             s_qf_to_lnum[string(qf_idx)]       = pr_buf_lnum
-            s_qf_to_lcount[string(qf_idx)]     = e.lcount
+            s_qf_to_lcount[string(qf_idx)]     = e.linecount
             s_qf_to_comment[string(qf_idx)]    = e.body
-            s_qf_to_suggestion[string(qf_idx)] = ParseSuggestionFromComment(e.body)
+            s_qf_to_suggestion[string(qf_idx)] = ParseSuggestionFromEvent(e)
 
             # Add lines for first comment, then all replies
             lines->add(RightAlign(
@@ -445,15 +445,34 @@ def FocusWindowLeft(create: bool = false)
     endif
 enddef
 
-def ParseSuggestionFromComment(comment: string): dict<any>
+def GetTargetLines(path: string, top: number, bot: number): list<string>
+    const bnr = bufnr(path)
+
+    if bnr != -1 && bufloaded(bnr)
+        return getbufline(bnr, top, bot)
+    endif
+
+    # Otherwise, read it straight off the hard drive
+    if filereadable(path)
+        const disk_lines = readfile(path)
+        if len(disk_lines) >= bot
+            return disk_lines[top - 1 : bot - 1]
+        endif
+    endif
+
+    return []
+enddef
+
+def ParseSuggestionFromEvent(event: dict<any>): dict<any>
     var suggestion = {
         exists: false,
         lcount: 0,
-        lines: []
+        lines: [],
+        original_lines: [],
     }
-
+    # Actual parsing
     var in_suggestion = false
-    for line in split(comment, "\n")
+    for line in split(event.body, "\n")
         if line == '```suggestion'
             in_suggestion = true
             continue
@@ -467,11 +486,21 @@ def ParseSuggestionFromComment(comment: string): dict<any>
         endif
     endfor
 
+    # Store original lines for later
+    if suggestion.exists
+        const bot = event.lineno
+        const top = bot - event.linecount + 1
+        suggestion.original_lines = GetTargetLines(event.path, top, bot)
+    endif
+
     return suggestion
 enddef
 
-def CommentSelectLines()
-    const curr_qf_idx = getqflist({idx: 0}).idx
+def CommentSelectLines(a_qf_idx: number = -1)
+    var curr_qf_idx = a_qf_idx
+    if curr_qf_idx == -1
+        curr_qf_idx = getqflist({idx: 0}).idx
+    endif
 
     const lcount = s_qf_to_lcount[string(curr_qf_idx)]
     execute 'cc ' .. curr_qf_idx
@@ -482,42 +511,47 @@ def CommentSelectLines()
     endif
 enddef
 
-def CommentApplySuggestion()
-    const curr_qf_idx = getqflist({idx: 0}).idx
-    const suggestion = s_qf_to_suggestion[string(curr_qf_idx)]
+def CommentApplySuggestion(a_qf_idx: number = -1)
+    var curr_qf_idx = a_qf_idx
+    if curr_qf_idx == -1
+        curr_qf_idx = getqflist({idx: 0}).idx
+    endif
+
+    const suggestion = get(s_qf_to_suggestion, string(curr_qf_idx), {exists: false})
     if !suggestion.exists
         return
     endif
 
-    CommentSelectLines()
-    execute "normal! \<Esc>"
+    const qf_item = getqflist()[curr_qf_idx - 1]
+    const target_bufnr = qf_item.bufnr
+    bufload(target_bufnr)
 
-    const top = line("'<")
-    const bottom = line("'>")
-    const old_lines_count = bottom - top + 1
+    const old_lines_count = s_qf_to_lcount[string(curr_qf_idx)]
+    const bot = qf_item.lnum
+    const top = bot - old_lines_count + 1
 
-    # Edge Case: The suggestion is a pure deletion
-    if suggestion.lcount == 0
-        execute top .. ',' .. bottom .. 'delete _'
+    const current_lines = getbufline(target_bufnr, top, bot)
+    if current_lines != suggestion.original_lines
+        execute $'silent! cc {curr_qf_idx}'
+        echom "Target lines have changed: Refusing to auto-apply suggestion."
         return
     endif
 
-    # FIXME What if we do this from PRHistoryBufer? Need a better way
-    # We could use this:
-    #   appendbufline(bufnr, lnum, lines)
-    #   deletebufline(bufnr, first, last)
-    # But still havent figured how to locate the buffer that needs changing
+    if suggestion.lcount == 0
+        # Plain deletion
+        deletebufline(target_bufnr, top, bot)
+    else
+        # Multiline replacement. Setline then delete/append not to mangle QF lnums
+        setbufline(target_bufnr, bot, suggestion.lines[-1])
+        if old_lines_count > 1
+            deletebufline(target_bufnr, top, bot - 1)
+        endif
+        if suggestion.lcount > 1
+            appendbufline(target_bufnr, top - 1, suggestion.lines[0 : suggestion.lcount - 2])
+        endif
+    endif
 
-    # To avoid mangling QF line numbers:
-    # Mutate the bottom line instead of deleting it, then delete old lines above,
-    # then insert new lines above (minus the one we setline'd already)
-    setline(bottom, suggestion.lines[-1])
-    if old_lines_count > 1
-        deletebufline('%', top, bottom - 1)
-    endif
-    if suggestion.lcount > 1
-        append(top - 1, suggestion.lines[0 : suggestion.lcount - 2])
-    endif
+    execute $'silent! cc {curr_qf_idx}'
 enddef
 
 # ============================================================
@@ -540,8 +574,8 @@ enddef
 export def Setup()
     LoadPullRequest("pabsan-0", "vim-pr-fix", 2)
 
-    command! PRFixCommentSelectLines CommentSelectLines()
-    command! PRFixCommentApplySuggestion CommentApplySuggestion()
+    command! -nargs=? PRFixCommentSelectLines     CommentSelectLines(<args>)
+    command! -nargs=? PRFixCommentApplySuggestion CommentApplySuggestion(<args>)
     command! PRFixHistoryToggle PRHistoryBufferToggle()
 
     # command! PRFixFiles
@@ -555,8 +589,13 @@ export def Setup()
     augroup END
 enddef
 
+# THIS release
 # TODO Add pr fetching and checking out
-# TODO Add info function
+# TODO Syntax ftplugin
+
+# FUTURE
 # TODO Add a changed file list -> this can be done with fugitive Gvdiffsplit
 # TODO Add two-pane diff view to edit files with change context?-> this can be done with fugitive Gvdiffsplit
-# TODO Syntax ftplugin
+# TODO Add info function
+# TODO Need a visual hint on PRHistoryBuffer for the currently active entry
+# TODO Add ghost text to qf entries, both on PRHistory and Worktree
