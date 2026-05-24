@@ -20,11 +20,12 @@ const WIDTH = 72
 
 # ---- script-level state ------------------------------------
 
-var s_pending:  number       = 0
-var s_raw:      dict<string> = {}
-var s_ctx:      dict<any>    = {}
-var s_pr_bufnr: number       = -1
-var s_pr_url:   string       = ""
+var s_pending:       number       = 0
+var s_raw:           dict<string> = {}
+var s_ctx:           dict<any>    = {}
+var s_pr_bufnr:      number       = -1
+var s_pr_url:        string       = ""
+var s_pr_sha_latest: string       = ""
 
 
 # Quickfix <-> PR-buffer line mappings (both keyed as strings)
@@ -111,6 +112,8 @@ def RenderEvents(): list<string>
         return []
     endtry
 
+    s_pr_sha_latest = commits[-1].sha
+
     var events: list<dict<any>> = []
 
     for c in issue_comments
@@ -160,17 +163,18 @@ def RenderEvents(): list<string>
         endif
 
         events->add({
-            kind:     'diff_thread',
-            user:     head.user.login,
-            body:     head.body,
-            path:     head.path,
-            lineno:   lineno,
-            linecount:   linecount,
-            loc:      head.path .. '#L' .. lineno,
-            outdated: get(head, 'position', v:null) == v:null,
-            replies:  replies,
-            time:     head.created_at,
+            kind:       'diff_thread',
+            user:       head.user.login,
+            body:       head.body,
+            path:       head.path,
+            lineno:     lineno,
+            linecount:  linecount,
+            loc:        head.path .. '#L' .. lineno,
+            outdated:   get(head, 'position', v:null) == v:null,
+            replies:    replies,
+            time:       head.created_at,
             browse_url: head.html_url,
+            diff_hunk:  head.diff_hunk,
         })
     endfor
 
@@ -190,6 +194,9 @@ def RenderEvents(): list<string>
     events->sort((a, b) => a.time < b.time ? -1 : a.time > b.time ? 1 : 0)
 
     # TODO clear function separation here
+
+    # Handle possible working tree modifications that mangle line numbers
+    ApplyLocalLineOffsets(events)
 
     # Build lines, recording qf positions as we go
     #
@@ -220,8 +227,11 @@ def RenderEvents(): list<string>
             lines += PrefixBody(e.body, '  │  ', '  │  ')
 
         elseif e.kind == 'diff_thread'
-            const tag         = e.outdated ? '  [outdated]' : ''
             const has_replies = !empty(e.replies)
+
+            var tag = ''
+            tag ..= e.outdated ? ' [outdated]' : ''
+            tag ..= e.changed ?  ' [orphaned]'  : ''
 
             # Register diff thread location to quickfix list
             const pr_buf_lnum = len(lines) + 1  # 1-based target line
@@ -386,6 +396,43 @@ export def PRHistoryBufferOnKeyO()
     Browse()
 enddef
 
+export def PRHistoryBufferOnKeyH()
+    # Open a helper buffer with suggestion info
+
+    # FIXME make this its own buffer type and allow better handling,
+    # autoupdating etc. For now enough, for debugging
+    const lnum = PRHistoryBufferEventLineSeekBack()
+    const qf_idx = s_lnum_to_qf[lnum]
+    const suggestion = s_qf_to_suggestion[string(qf_idx)]
+
+    if !suggestion.exists
+        echom "No suggestion in current comment"
+        return
+    endif
+
+    const scratch_name = 'PRCommentInfo'
+    const winid = bufwinid(scratch_name)
+    if winid == -1
+        execute 'belowright split ' .. scratch_name
+        setlocal buftype=nofile bufhidden=hide nobuflisted noswapfile
+        wincmd p
+    endif
+
+    const bnr = bufnr(scratch_name)
+
+    # 1. Assemble all the text pieces in memory
+    var payload: list<string> = []
+
+    payload += ['=== Original ===']
+    payload += suggestion.original_lines
+    payload += ['=== Suggested ===']
+    payload += suggestion.lines
+
+    deletebufline(bnr, 1, '$')
+    setbufline(bnr, 1, payload)
+    execute 'win_execute(' .. bufwinid(bnr) .. ', "resize " .. ' .. max([1, len(payload)]) .. ')'
+enddef
+
 def PRHistoryBufferOnQuickFixJump()
     const curr_qf_idx = getqflist({idx: 0}).idx
 
@@ -512,9 +559,20 @@ def ParseSuggestionFromEvent(event: dict<any>): dict<any>
 
     # Store original lines for later
     if suggestion.exists
-        const bot = event.lineno
-        const top = bot - event.linecount + 1
-        suggestion.original_lines = FileReadLines(event.path, top, bot)
+        const raw_hunk = split(get(event, 'diff_hunk', ''), "\n")
+        var needed = event.linecount
+
+        # Keep context (' ') and additions ('+'), strip the first char
+        for i in range(len(raw_hunk) - 1, 0, -1)
+            const line = raw_hunk[i]
+            if line =~ '^@@' || needed <= 0
+                break
+            endif
+            if line[0] == ' ' || line[0] == '+'
+                suggestion.original_lines->insert(line[1 : ], 0)
+                needed -= 1
+            endif
+        endfor
     endif
 
     return suggestion
@@ -598,6 +656,71 @@ def Browse()
     system("xdg-open " .. s_pr_url .. " >/dev/null 2>&1")
 enddef
 
+def ApplyLocalLineOffsets(events: list<dict<any>>)
+    var file_offsets: dict<list<dict<number>>> = {}
+
+    for e in events
+        if e.kind == 'diff_thread'
+            # Parse git diff to for changes in the working tree
+            if !has_key(file_offsets, e.path)
+                var hunks: list<dict<number>> = []
+
+                if filereadable(e.path)
+                    const cmd = $'git diff -U0 {s_pr_sha_latest} -- "{e.path}"'
+                    const diff_output = systemlist(cmd)
+                    var cumulative_delta = 0
+
+                    for line in diff_output
+                        if line =~ '^@@'
+                            const matches = matchlist(line, '^@@ -\(\d\+\)\%(,\(\d\+\)\)\? +\(\d\+\)\%(,\(\d\+\)\)\? @@')
+                            if !empty(matches)
+                                const old_start = str2nr(matches[1])
+                                const old_count = matches[2] == '' ? 1 : str2nr(matches[2])
+                                const new_start = str2nr(matches[3])
+                                const new_count = matches[4] == '' ? 1 : str2nr(matches[4])
+
+                                cumulative_delta += (new_count - old_count)
+
+                                hunks->add({
+                                    old_start: old_start,
+                                    old_end: old_start + old_count - 1,
+                                    delta: cumulative_delta
+                                })
+                            endif
+                        endif
+                    endfor
+                endif
+
+                file_offsets[e.path] = hunks
+            endif
+
+            # Calculate the line offset based on the cached hunks
+            const hunks = file_offsets[e.path]
+            var shift = 0
+            var changed = false
+
+            for hunk in hunks
+                if e.lineno < hunk.old_start
+                    break
+                elseif e.lineno >= hunk.old_start && e.lineno <= hunk.old_end
+                    changed = true
+                    break
+                else
+                    shift = hunk.delta
+                endif
+            endfor
+
+            # Apply the results to the event object
+            if changed
+                e.changed = true
+            else
+                e.changed = false
+                e.lineno += shift
+            endif
+        endif
+    endfor
+enddef
+
 # ============================================================
 # Entrypoint
 # ============================================================
@@ -614,6 +737,12 @@ def LoadPullRequest(owner: string, repo: string, prnum: number)
     PRHistoryBufferCreate(lines)
 
 enddef
+
+# def Load(prnum: number = -1)
+#     if prnum == -1
+#         LoadSelectionMenu()
+#     endif
+# enddef
 
 export def Setup()
     LoadPullRequest("pabsan-0", "vim-pr-fix", 2)
