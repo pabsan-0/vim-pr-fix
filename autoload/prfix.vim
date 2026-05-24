@@ -32,6 +32,7 @@ var s_pr_sha_latest: string       = ""
 var s_qf_items:         list<dict<any>> = []
 var s_lnum_to_qf:       dict<number>    = {}   # string(pr_buf_lnum) -> qf idx (1-based)
 var s_qf_to_lnum:       dict<number>    = {}   # string(qf_idx)      -> pr_buf_lnum
+var s_qf_to_lnum_end:   dict<number>    = {}   # string(qf_idx)      -> pr_buf_lnum
 var s_qf_to_lcount:     dict<number>    = {}   # string(qf_idx)      -> qf entry number of lines
 var s_qf_to_comment:    dict<string>    = {}   # string(qf_idx)      -> qf entry comment
 var s_qf_to_suggestion: dict<dict<any>> = {}   # string(qf_idx)      -> qf entry suggestion object
@@ -61,15 +62,17 @@ def AssertEnvironment(prnum: number): bool
 enddef
 
 def LoadRepoFromCWD(strict: bool = true): any
-    const cmd = 'gh repo view --json owner,name'
-    const out = system(cmd)
-    if v:shell_error == 0
-        const data = json_decode(out)
-        return {owner: data.owner.login, repo: data.name}
+    const url = system('git config --get remote.origin.url')->trim()
+    if v:shell_error == 0 && !empty(url)
+        const clean_url = substitute(url, '\.git$', '', '')
+        const matches = matchlist(clean_url, '\v[:/]([^/]+)/([^/]+)$')
+        if len(matches) >= 3
+            return {owner: matches[1], repo: matches[2]}
+        endif
     endif
 
     if strict
-        throw "Not in a Git repository."
+        throw "Not in a Git repository or no remote found."
     endif
     return v:null
 enddef
@@ -108,8 +111,8 @@ def LoadPullNumFromPrompt(owner: string, repo: string): number
     redraw
     echo $"Open PRs for {owner}/{repo}:"
     for pr in prs
-        const checked_out_flag = pr.number == checked_out_pull ? " (checked out)" : ""
-        echo $"  #{pr.number}  {pr.title} @{pr.author.login}" .. checked_out_flag
+        const mark = pr.number == checked_out_pull ? "* " : "  "
+        echo $" {mark}#{pr.number}  {pr.title} @{pr.author.login}"
     endfor
     echo ""
     const pr_num = str2nr(input("Enter PR number (empty to cancel): #"))
@@ -323,7 +326,7 @@ def RenderEvents(): list<string>
     #
     # Header
     var lines: list<string> = [
-        '  PR #' .. s_ctx.pr .. '  ·  ' .. s_ctx.owner .. '/' .. s_ctx.repo,
+        $"  PR #{s_ctx.pr} · {s_ctx.owner}/{s_ctx.repo}",
         repeat('━', WIDTH),
         '',
     ]
@@ -386,6 +389,8 @@ def RenderEvents(): list<string>
             if has_replies
                 lines->add('  │')
             endif
+
+            s_qf_to_lnum_end[string(qf_idx)] = len(lines) + 1
         endif
     endfor
 
@@ -414,6 +419,7 @@ export def PRHistoryBufferCreate(lines: list<string>)
     setbufvar(bufnr, '&bufhidden', 'hide')
     setbufvar(bufnr, '&swapfile',  0)
     setbufvar(bufnr, '&filetype',  'prhistory')
+    setbufvar(bufnr, '&signcolumn', 'no')
 
     s_pr_bufnr = bufnr
 
@@ -559,8 +565,19 @@ def PRHistoryBufferOnQuickFixJump()
     # Focus current QF-related comment on PRHistory
     const winid = bufwinid(s_pr_bufnr)
     const pr_lnum = get(s_qf_to_lnum, string(curr_qf_idx), -1)
+    const pr_lnum_end = get(s_qf_to_lnum_end, string(curr_qf_idx), -1)
+
     if winid != -1 && pr_lnum != -1
-        win_execute(winid, $'normal! {pr_lnum}Gzz')
+        # Center in view
+        win_execute(winid, $'normal! {pr_lnum}Gzz0ww')
+
+        # Update PRHistory buffer higlighting to adequate lines
+        const hl_sign = 'PRHistoryQuickfixActiveLine'
+        const hl_group = hl_sign .. 'Group'
+        sign_unplace(hl_group, {buffer: s_pr_bufnr})
+        for lnum in range(pr_lnum, pr_lnum_end - 1)
+            sign_place(0, hl_group, hl_sign, s_pr_bufnr, {lnum: lnum})
+        endfor
     endif
 
     # Inject the suggestion-lines-list into register 'p' as Linewise block ('V')
@@ -595,7 +612,7 @@ def MergePages(raw: string): list<dict<any>>
 enddef
 
 def RightAlign(left: string, ts: string): string
-    const padding = max([1, WIDTH - len(left) - len(ts)])
+    const padding = max([1, WIDTH - strdisplaywidth(left) - strdisplaywidth(ts)])
     return left .. repeat(' ', padding) .. ts
 enddef
 
@@ -774,7 +791,7 @@ def CommentApplySuggestion(a_qf_idx: number = -1)
     endif
 
     execute $'silent! cc {curr_qf_idx}'
-    # execute $'normal! {top}GV{bot}G'
+    execute $'normal! {top}GV{bot}G'
 enddef
 
 def CommentBrowse(a_qf_idx: number = -1)
@@ -861,6 +878,10 @@ enddef
 # ============================================================
 
 export def Setup(arg: string = "")
+
+    highlight default PRHistoryQuickfixActive ctermbg=237 guibg=#3a3a3a
+    sign define PRHistoryQuickfixActiveLine linehl=PRHistoryQuickfixActive
+
     Load(arg)
 
     command! -nargs=? PRFixCommentSelectLines     CommentSelectLines(<args>)
@@ -878,6 +899,7 @@ export def Setup(arg: string = "")
         autocmd BufEnter * PRHistoryBufferOnBufEnter()
         autocmd User QuickFixJumpPost PRHistoryBufferOnQuickFixJump()
     augroup END
+
 enddef
 
 # THIS release
