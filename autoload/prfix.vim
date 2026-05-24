@@ -37,9 +37,130 @@ var s_qf_to_comment:    dict<string>    = {}   # string(qf_idx)      -> qf entry
 var s_qf_to_suggestion: dict<dict<any>> = {}   # string(qf_idx)      -> qf entry suggestion object
 var s_qf_to_browse_url: dict<string>    = {}   # string(qf_idx)      -> qf entry suggestion object
 
+# ============================================================
+# Entrypoint
+# ============================================================
 
-def AssertEnvironment(): bool
+def AssertEnvironment(prnum: number): bool
+    # Redudant check, we may have arrived from elsewhere
+    var r = RunShell('git rev-parse --is-inside-work-tree')
+    if !r.ok
+        ErrorBuf('[PRFix] Not inside a git repository', r.lines)
+        return false
+    endif
+
+    # Checkout PR tip. Failure is fatal, the user is responsible
+    # for allowing this action if fails (stashing... etc)
+    r = RunShell($'gh pr checkout {prnum}')
+    if !r.ok
+        ErrorBuf($'[PRFix] Failed to checkout PR #{prnum}', r.lines)
+        return false
+    endif
+
     return true
+enddef
+
+def LoadRepoFromCWD(strict: bool = true): any
+    const cmd = 'gh repo view --json owner,name'
+    const out = system(cmd)
+    if v:shell_error == 0
+        const data = json_decode(out)
+        return {owner: data.owner.login, repo: data.name}
+    endif
+
+    if strict
+        throw "Not in a Git repository."
+    endif
+    return v:null
+enddef
+
+def LoadPullNumFromWorktree(strict: bool = true): number
+    const cmd = $"gh pr list --search $(git rev-parse HEAD) --state open --json number -q '.[0].number'"
+    const result = system(cmd)
+    if v:shell_error != 0
+        if strict
+            throw "Current branch not sitting in a PR."
+        endif
+        return -1
+    endif
+
+    # Still works if not on tip of PR, but older commit!
+    return str2nr(result)
+enddef
+
+def LoadPullNumFromPrompt(owner: string, repo: string): number
+    const cmd = $"gh pr list --repo {owner}/{repo} --state open --limit 20 --json number,title,author"
+    const result = system(cmd)
+    if v:shell_error != 0
+        echoerr "Failed to fetch PRs."
+        return -1
+    endif
+
+    const prs = json_decode(result)
+    if empty(prs)
+        echom "No open PRs found."
+        return -1
+    endif
+
+    const checked_out_pull = LoadPullNumFromWorktree(false)
+
+    # FIXME Mark the currently checked out PR, if any
+    redraw
+    echo $"Open PRs for {owner}/{repo}:"
+    for pr in prs
+        const checked_out_flag = pr.number == checked_out_pull ? " (checked out)" : ""
+        echo $"  #{pr.number}  {pr.title} @{pr.author.login}" .. checked_out_flag
+    endfor
+    echo ""
+    const pr_num = str2nr(input("Enter PR number (empty to cancel): #"))
+    echo "\n"
+
+    return pr_num > 0 ? pr_num : -1
+enddef
+
+def Load(arg: string = "")
+    var target_owner = ""
+    var target_repo  = ""
+    var target_pr    = -1
+
+    # No arguments: Expects being in repo, will ask for PR number to fix
+    if arg == ""
+        const info = LoadRepoFromCWD()
+        target_owner = info.owner
+        target_repo  = info.repo
+        target_pr    = LoadPullNumFromPrompt(target_owner, target_repo)
+
+    # Number argument: Expects being in repo. Will go straight to fixing
+    elseif arg =~ '^\d\+$'
+        const info = LoadRepoFromCWD()
+        target_owner = info.owner
+        target_repo  = info.repo
+        target_pr    = str2nr(arg)
+
+    # Dot: currently checked-out PR
+    elseif arg == "."
+        const info = LoadRepoFromCWD()
+        target_owner = info.owner
+        target_repo  = info.repo
+        target_pr    = LoadPullNumFromWorktree()
+    else
+        throw "PRFix: Invalid argument: " .. arg
+    endif
+
+    if target_pr == -1
+        throw "Could not parse PR number"
+    endif
+
+    var r = AssertEnvironment(target_pr)
+    if r == false
+        return
+    endif
+
+    # Main launch
+    # FIXME convert callback chain into main()-like function
+    FetchPRData(target_owner, target_repo, target_pr)
+    const lines = RenderEvents()
+    PRHistoryBufferCreate(lines)
 enddef
 
 # ============================================================
@@ -415,7 +536,6 @@ export def PRHistoryBufferOnKeyH()
     if winid == -1
         execute 'belowright split ' .. scratch_name
         setlocal buftype=nofile bufhidden=hide nobuflisted noswapfile
-        wincmd p
     endif
 
     const bnr = bufnr(scratch_name)
@@ -507,6 +627,7 @@ enddef
 
 def FocusWindowLeft(create: bool = false)
     # Attempt to move to the left window
+    # FIXME would wincmd p be safer?
     wincmd h
 
     # If the window ID hasn't changed, we are the only window: Create a vertical split to the left.
@@ -531,6 +652,19 @@ def FileReadLines(path: string, top: number, bot: number): list<string>
     endif
 
     return []
+enddef
+
+def ErrorBuf(header: string, lines: list<string>)
+    botright :15new
+    setlocal buftype=nofile bufhidden=wipe nobuflisted noswapfile
+    silent! execute 'filename PRFix\ Errors'
+    setline(1, [header, repeat('─', 60), ''] + lines)
+    setlocal nomodifiable
+enddef
+
+def RunShell(cmd: string): dict<any>
+    var out = systemlist(cmd .. ' 2>&1')
+    return {ok: v:shell_error == 0, lines: out}
 enddef
 
 def ParseSuggestionFromEvent(event: dict<any>): dict<any>
@@ -640,6 +774,7 @@ def CommentApplySuggestion(a_qf_idx: number = -1)
     endif
 
     execute $'silent! cc {curr_qf_idx}'
+    # execute $'normal! {top}GV{bot}G'
 enddef
 
 def CommentBrowse(a_qf_idx: number = -1)
@@ -725,27 +860,8 @@ enddef
 # Entrypoint
 # ============================================================
 
-def LoadPullRequest(owner: string, repo: string, prnum: number)
-    var r = AssertEnvironment()
-    if r == false
-        return
-    endif
-
-    FetchPRData(owner, repo, prnum)
-
-    const lines = RenderEvents()
-    PRHistoryBufferCreate(lines)
-
-enddef
-
-# def Load(prnum: number = -1)
-#     if prnum == -1
-#         LoadSelectionMenu()
-#     endif
-# enddef
-
-export def Setup()
-    LoadPullRequest("pabsan-0", "vim-pr-fix", 2)
+export def Setup(arg: string = "")
+    Load(arg)
 
     command! -nargs=? PRFixCommentSelectLines     CommentSelectLines(<args>)
     command! -nargs=? PRFixCommentApplySuggestion CommentApplySuggestion(<args>)

@@ -5,4 +5,4 @@ if exists('g:loaded_prfix')
 endif
 g:loaded_prfix = true
 
-command! PRFix prfix#Setup()
+command! -nargs=? PRFix prfix#Setup(<q-args>)
