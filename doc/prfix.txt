@@ -13,10 +13,22 @@ CONTENTS                                                        *prfix-contents*
 1. INTRODUCTION                                             *prfix-introduction*
 
 prfix.vim is a Vim9 plugin that turns an open GitHub pull request into an
-interactive review session.  It fetches inline review comments via the `gh`
-CLI, populates the quickfix list, and opens a three-pane layout so you can
-navigate each comment, preview its full body, and apply or mark it fixed —
-without leaving Vim.
+interactive review session.  It fetches the full event timeline of a PR —
+commits, reviews, issue comments, and inline diff threads — via the `gh` CLI,
+populates the quickfix list with all inline diff comments, and opens a
+two-pane layout (source file on the left, PR History buffer on the right) so
+you can navigate every comment without leaving Vim.
+
+Key capabilities:
+
+    - Chronological PR History buffer with all events (commits, reviews,
+      issue comments, inline diff threads with replies)
+    - Quickfix list kept in sync with the PR History buffer
+    - Auto-apply suggestion blocks or visually select commented lines
+    - Open any comment or the whole PR in the browser
+    - Reload PR data without restarting the session
+    - Working-tree awareness: line numbers are adjusted when local edits
+      shift the commented lines relative to the PR tip
 
 ==============================================================================
 2. REQUIREMENTS                                             *prfix-requirements*
@@ -24,57 +36,125 @@ without leaving Vim.
     - Vim 9 (Vim9script)
     - `git` available in $PATH
     - `gh` GitHub CLI (https://cli.github.com) authenticated
-    - vim-gitgutter recommended (shows which lines have been modified)
 
 ==============================================================================
 3. LAYOUT                                                       *prfix-layout*
 
-Running |:PRfix| opens a new tab with three panes:
+Running |:PRFix| opens a vertical split:
 
-    ┌────────────────────────────────────────────────────────────┐
-    │                                                            │
-    │                   source file (top)                        │
-    │                                                            │
-    ├────────────────────────────┬───────────────────────────────┤
-    │  quickfix list (bottom-    │  comment preview (bottom-     │
-    │  left)  ── QF entries,     │  right)  ── full body of the  │
-    │  one per review comment    │  currently focused comment    │
-    └────────────────────────────┴───────────────────────────────┘
+    ┌──────────────────────────────┬────────────────────────────────┐
+    │                              │  PR History buffer             │
+    │   source file                │  (chronological event timeline │
+    │   (left pane)                │   with commits, reviews,       │
+    │                              │   comments, diff threads)      │
+    └──────────────────────────────┴────────────────────────────────┘
 
-Moving the cursor inside the quickfix window, or navigating with `:cnext` /
-`:cprev` in the source pane, updates the comment preview automatically.
+The quickfix list is populated with all inline diff comments.  Navigating it
+with `:cnext` / `:cprev`, or with `<C-n>` / `<C-p>` inside the PR History
+buffer, scrolls the PR History buffer to highlight the matching entry.
+Pressing `<CR>` inside the PR History buffer jumps the source file to the
+commented location.
+
+The PR History buffer uses the `prhistory` filetype and has its own syntax
+highlighting group.  Inline diff comments that land on lines that have been
+locally modified since the PR tip are tagged `[orphaned]`; comments on
+lines shifted by local edits are adjusted automatically.
 
 ==============================================================================
 4. MAPPINGS                                                     *prfix-mappings*
 
-The following mappings are buffer-local and only active inside the quickfix
-window opened by |:PRfix|.
+The following mappings are buffer-local and only active inside the PR History
+buffer (filetype `prhistory`).
 
-    <leader>pf  Mark the entry under the cursor as fixed.  The entry stays
-                in the list with a `[x]` prefix and strikethrough styling so
-                the session history is preserved.
+    <CR>    Jump to the source file location of the comment nearest to the
+            cursor (seeks backward to the first event header above the
+            cursor).
 
-    <leader>ps  Apply the ```suggestion block from the current comment.  The
-                suggested lines are inserted in place (above the original
-                commented range) and visually selected, making it easy to
-                move them with `gvd` / `gvp` or delete with `gvd`.
+    <C-n>   Run `:cnext` but keep focus on PR History, i.e. jump to next comment 
+
+    <C-p>   Run `:cprev`  but keep focus on PR History, i.e. jump to next comment 
+
+    o       Open the comment under the cursor in the browser (using
+            `xdg-open`).
+
+    O       Open the whole PR page in the browser.
+
+    H       Show the suggestion block and the original lines it replaces in
+            a temporary scratch buffer (`PRCommentInfo`).  Reports a message
+            if the current comment carries no suggestion.
+
+    r       Re-fetch all PR data from GitHub and reload the PR History
+            buffer, restoring the current quickfix position.
 
 ==============================================================================
 5. COMMANDS                                                     *prfix-commands*
 
-*:PRFix*
-    Start a PR review session.  The startup sequence is:
+All commands below (except |:PRFix| itself) are registered when |:PRFix| is
+run and removed when |:PRFixQuit| is called.
+
+*:PRFix* [{arg}]
+    Start a PR review session.
+
+    With no argument, the plugin lists open PRs for the current repository
+    and prompts you to enter a PR number.  The currently checked-out PR (if
+    any) is marked with `*` in the list.
+
+    {arg} may be:
+
+        {number}    Go straight to the PR with that number without prompting.
+        .           Use the PR that corresponds to the currently checked-out
+                    branch (detected via `gh pr list --search <HEAD SHA>`).
+
+    Startup sequence:
 
         1. Verify the working directory is inside a git repository.
-        2. Fetch the list of open pull requests via `gh pr list`.
-        3. Prompt you to select a PR; the one whose branch matches the
-           current HEAD branch is pre-selected (marked with `*`).
-        4. Check out the selected PR with `gh pr checkout`.
-        5. Fetch inline review comments from the GitHub API.
-        6. Open the three-pane review layout in a new tab.
+        2. Check out the selected PR with `gh pr checkout`.
+        3. Fetch all PR events in parallel via the GitHub API
+           (issue comments, reviews, inline diff comments, commits).
+        4. Render the chronological PR History buffer and open it in a
+           vertical split to the right of the current window.
+        5. Populate the quickfix list with all inline diff comments.
 
     If any step fails, a scratch buffer is opened showing the error header
     and the full command output so the problem is easy to diagnose.
+
+    After |:PRFix| completes successfully the following additional commands
+    are registered for the session:
+
+        |:PRFixHistoryToggle|
+        |:PRFixApplySuggestion|
+        |:PRFixSelectLines|
+        |:PRFixBrowse|
+        |:PRFixQuit|
+
+*:PRFixHistoryToggle*
+    Show the PR History buffer if it is currently hidden, or close it if it
+    is visible.
+
+*:PRFixApplySuggestion* [{n}]
+    Apply the suggestion block from quickfix entry {n} (default: current
+    entry) directly into the source buffer.
+
+    The plugin verifies that the target lines still match the original lines
+    recorded in the diff hunk before making any change.  If they differ (the
+    user has already edited the area), the command refuses to apply and
+    emits a message.
+
+    After a successful apply the replaced lines are visually selected so the
+    change is immediately visible.
+
+*:PRFixSelectLines* [{n}]
+    Visually select the range of source lines referenced by quickfix entry
+    {n} (default: current entry), jumping to the file if necessary.
+
+*:PRFixBrowse* [{n}]
+    Open the GitHub page for quickfix entry {n} (default: current entry) in
+    the browser via `xdg-open`.
+
+*:PRFixQuit*
+    Close the PR History buffer, wipe the `PRCommentInfo` scratch buffer if
+    open, clear the quickfix list, remove all session autocmds and commands,
+    and reset all internal state.
 
 ==============================================================================
 vim:ft=help:tw=78:
