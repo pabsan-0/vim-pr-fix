@@ -70,9 +70,9 @@ buffer (filetype `prhistory`).
             cursor (seeks backward to the first event header above the
             cursor).
 
-    <C-n>   Run `:cnext` and focus the source (left) window.
+    <C-n>   Run `:cnext` but keep focus on PR History, i.e. jump to next comment 
 
-    <C-p>   Run `:cprev` and focus the source (left) window.
+    <C-p>   Run `:cprev`  but keep focus on PR History, i.e. jump to next comment 
 
     o       Open the comment under the cursor in the browser (using
             `xdg-open`).
