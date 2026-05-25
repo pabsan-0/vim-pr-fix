@@ -107,7 +107,7 @@ def LoadPullNumFromPrompt(owner: string, repo: string): number
 
     const checked_out_pull = LoadPullNumFromWorktree(false)
 
-    # FIXME Mark the currently checked out PR, if any
+    # FIXME Cover case where there are so many that they dont fit. FZF?
     redraw
     echo $"Open PRs for {owner}/{repo}:"
     for pr in prs
@@ -325,8 +325,9 @@ def RenderEvents(): list<string>
     # Build lines, recording qf positions as we go
     #
     # Header
+    # FIXME add PR title
     var lines: list<string> = [
-        $"  PR #{s_ctx.pr} · {s_ctx.owner}/{s_ctx.repo}",
+        RightAlign($"  PR #{s_ctx.pr} · {s_ctx.owner}/{s_ctx.repo}", strftime('%Y-%m-%d %H:%M')),
         repeat('━', WIDTH),
         '',
     ]
@@ -340,14 +341,14 @@ def RenderEvents(): list<string>
 
         if e.kind == 'commit'
             lines->add(RightAlign(
-                '  ○  ' .. e.user .. '  committed  ' .. e.sha .. '  ' .. e.msg, ts))
+                '  ○  ' .. e.user .. ' committed  ' .. e.sha .. '  ' .. e.msg, ts))
 
         elseif e.kind == 'review'
             lines->add(RightAlign(
-                '  ◇  ' .. e.user .. '  ' .. ReviewLabel(e.state), ts))
+                '  ◇  ' .. e.user .. ' ' .. ReviewLabel(e.state), ts))
 
         elseif e.kind == 'issue_comment'
-            lines->add(RightAlign('  ●  ' .. e.user .. '  commented', ts))
+            lines->add(RightAlign('  ●  ' .. e.user .. ' commented', ts))
             lines += PrefixBody(e.body, '  │  ', '  │  ')
 
         elseif e.kind == 'diff_thread'
@@ -376,7 +377,7 @@ def RenderEvents(): list<string>
 
             # Add lines for first comment, then all replies
             lines->add(RightAlign(
-                '  ●  ' .. e.user .. '  in ' .. e.loc .. tag, ts))
+                '  ●  ' .. e.user .. ' commented in ' .. e.loc .. tag, ts))
 
             lines += PrefixBody(e.body, '  │  ', '  │  ')
 
@@ -523,6 +524,7 @@ export def PRHistoryBufferOnKeyO()
     Browse()
 enddef
 
+# FIXME not only for suggestions, but also original_lines of a comment
 export def PRHistoryBufferOnKeyH()
     # Open a helper buffer with suggestion info
 
@@ -557,6 +559,31 @@ export def PRHistoryBufferOnKeyH()
     deletebufline(bnr, 1, '$')
     setbufline(bnr, 1, payload)
     execute 'win_execute(' .. bufwinid(bnr) .. ', "resize " .. ' .. max([1, len(payload)]) .. ')'
+enddef
+
+export def PRHistoryBufferOnKeyr()
+    if empty(s_ctx)
+        return
+    endif
+
+    echom "Reloading PR #" .. s_ctx.pr .. "..."
+    redraw
+
+    const curr_qf_idx = getqflist({idx: 0}).idx
+
+    FetchPRData(s_ctx.owner, s_ctx.repo, s_ctx.pr)
+    const lines = RenderEvents()
+    PRHistoryBufferLoadLines(s_pr_bufnr, lines)
+
+    # Restore the cursor / Quickfix position, fallback to 1
+    if curr_qf_idx > 0 && curr_qf_idx <= len(s_qf_items)
+        execute $'silent! cc {curr_qf_idx}'
+    elseif len(s_qf_items) > 0
+        silent! cc 1
+    endif
+
+    redraw
+    echom "Reloaded PR #" .. s_ctx.pr .. "!"
 enddef
 
 def PRHistoryBufferOnQuickFixJump()
@@ -884,12 +911,13 @@ export def Setup(arg: string = "")
 
     Load(arg)
 
-    command! -nargs=? PRFixCommentSelectLines     CommentSelectLines(<args>)
-    command! -nargs=? PRFixCommentApplySuggestion CommentApplySuggestion(<args>)
-    command! -nargs=? PRFixCommentBrowse          CommentBrowse(<args>)
+    command! -nargs=? PRFixSelectLines     CommentSelectLines(<args>)
+    command! -nargs=? PRFixApplySuggestion CommentApplySuggestion(<args>)
+    command! -nargs=? PRFixBrowse          CommentBrowse(<args>)
 
     command! PRFixHistoryToggle PRHistoryBufferToggle()
     command! PRFixBrowse        Browse()
+    command! PRFixQuit          Quit()
 
     # command! PRFixFiles
     # command! PRFixQuit
@@ -902,9 +930,49 @@ export def Setup(arg: string = "")
 
 enddef
 
-# THIS release
-# TODO Add pr fetching and checking out
-# TODO Syntax ftplugin
+export def Quit()
+    silent! delcommand PRFixSelectLines
+    silent! delcommand PRFixApplySuggestion
+    silent! delcommand PRFixBrowse
+    silent! delcommand PRFixHistoryToggle
+    silent! delcommand PRFixBrowse
+    silent! delcommand PRFixQuit
+
+    if exists('#PRHistoryAutoCmd')
+        autocmd! PRHistoryAutoCmd
+        augroup! PRHistoryAutoCmd
+    endif
+
+    silent! sign_unplace('PRHistoryQuickfixActiveLineGroup')
+    silent! sign_undefine('PRHistoryQuickfixActiveLine')
+
+    if s_pr_bufnr != -1 && bufexists(s_pr_bufnr)
+        execute 'silent! bwipeout ' .. s_pr_bufnr
+    endif
+    const info_buf = bufnr('PRCommentInfo')
+    if info_buf != -1
+        execute 'silent! bwipeout ' .. info_buf
+    endif
+
+    setqflist([], 'r')
+
+    s_pending          = 0
+    s_raw              = {}
+    s_ctx              = {}
+    s_pr_bufnr         = -1
+    s_pr_url           = ""
+    s_pr_sha_latest    = ""
+    s_qf_items         = []
+    s_lnum_to_qf       = {}
+    s_qf_to_lnum       = {}
+    s_qf_to_lnum_end   = {}  # <-- Don't forget this one!
+    s_qf_to_lcount     = {}
+    s_qf_to_comment    = {}
+    s_qf_to_suggestion = {}
+    s_qf_to_browse_url = {}
+
+    echom "PRFix session closed and cleaned up."
+enddef
 
 # FUTURE
 # TODO Add a changed file list -> this can be done with fugitive Gvdiffsplit
