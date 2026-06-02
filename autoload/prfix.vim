@@ -639,8 +639,20 @@ def MergePages(raw: string): list<dict<any>>
 enddef
 
 def RightAlign(left: string, ts: string): string
-    const padding = max([1, WIDTH - strdisplaywidth(left) - strdisplaywidth(ts)])
-    return left .. repeat(' ', padding) .. ts
+    const ts_width = strdisplaywidth(ts)
+    var clean_left = left
+    var left_width = strdisplaywidth(clean_left)
+
+    # If the text is too long for the screen, truncate it safely
+    if left_width + ts_width >= WIDTH
+        # Reserve 1 space for padding, and 1 for the ellipsis character
+        const available_width = WIDTH - ts_width - 2
+        clean_left = strcharpart(clean_left, 0, available_width) .. '…'
+        left_width = strdisplaywidth(clean_left)
+    endif
+
+    const padding = max([1, WIDTH - left_width - ts_width])
+    return clean_left .. repeat(' ', padding) .. ts
 enddef
 
 def ShortDate(iso: string): string
@@ -658,14 +670,55 @@ def ReviewLabel(state: string): string
 enddef
 
 def PrefixBody(body: string, first_pfx: string, rest_pfx: string): list<string>
-    const raw = split(body, "\n", true)
-    if empty(raw)
+    const clean_body = substitute(body, '\r', '', 'g')
+    const raw_lines = split(clean_body, "\n", true)
+    if empty(raw_lines)
         return []
     endif
-    var out: list<string> = [first_pfx .. raw[0]]
-    for l in raw[1 : ]
-        out->add(rest_pfx .. l)
+
+    var out: list<string> = []
+    const max_len_first = WIDTH - strdisplaywidth(first_pfx)
+    const max_len_rest = WIDTH - strdisplaywidth(rest_pfx)
+
+    var is_first = true
+
+    for raw_line in raw_lines
+        var current_max = is_first ? max_len_first : max_len_rest
+
+        if strdisplaywidth(raw_line) <= current_max
+            out->add((is_first ? first_pfx : rest_pfx) .. raw_line)
+            is_first = false
+            continue
+        endif
+
+        # Line exceeds max width; wrap it while preserving indentation
+        const indent = matchstr(raw_line, '^\s*')
+        const content = strcharpart(raw_line, strchars(indent))
+        var words = split(content, '\s\+')
+
+        if empty(words)
+            out->add((is_first ? first_pfx : rest_pfx) .. raw_line)
+            is_first = false
+            continue
+        endif
+
+        var curr_line = indent .. words[0]
+        for i in range(1, len(words) - 1)
+            const word = words[i]
+            if strdisplaywidth(curr_line .. ' ' .. word) > current_max
+                out->add((is_first ? first_pfx : rest_pfx) .. curr_line)
+                is_first = false
+                current_max = max_len_rest
+                curr_line = indent .. word
+            else
+                curr_line ..= ' ' .. word
+            endif
+        endfor
+
+        out->add((is_first ? first_pfx : rest_pfx) .. curr_line)
+        is_first = false
     endfor
+
     return out
 enddef
 
