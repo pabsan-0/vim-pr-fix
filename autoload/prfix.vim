@@ -278,11 +278,24 @@ def RenderEvents(): list<string>
     for root in thread_roots
         const head    = threads[root][0]
         const replies = threads[root][1 : ]
-        const lineno  = get(head, 'line', get(head, 'original_line', '?'))
 
-        const start_line = get(head, 'start_line', get(head, 'original_start_line', v:null))
+        # Safely extract lineno (GitHub API returns `null` for outdated comments)
+        var lineno = get(head, 'line', v:null)
+        if type(lineno) != v:t_number
+            lineno = get(head, 'original_line', v:null)
+        endif
+
+        if type(lineno) != v:t_number
+            lineno = 1 # Absolute fallback so Quickfix and offsets don't crash
+        endif
+
+        var start_line = get(head, 'start_line', v:null)
+        if type(start_line) != v:t_number
+            start_line = get(head, 'original_start_line', v:null)
+        endif
+
         var linecount = 1
-        if type(lineno) == v:t_number && type(start_line) == v:t_number
+        if type(start_line) == v:t_number && start_line <= lineno
             linecount = lineno - start_line + 1
         endif
 
