@@ -170,6 +170,35 @@ enddef
 # GH API PR data fetching
 # ============================================================
 
+# Start a gh api job that appends output to s_raw[key].
+# paginate=true uses --paginate (for list endpoints).
+# paginate=false fetches a single page (for object endpoints like pr_info).
+def StartFetchJob(endpoint: string, key: string, paginate: bool = true)
+    if !has_key(s_raw, key)
+        s_raw[key] = ''
+    endif
+    s_pending += 1
+
+    const k = key
+
+    def OutCb(channel: channel, line: string)
+        s_raw[k] ..= line .. "\n"
+    enddef
+
+    def CloseCb(channel: channel)
+        s_pending -= 1
+    enddef
+
+    def ErrCb(channel: channel, msg: string)
+        echoerr '[pr_comments/' .. k .. '] ' .. msg
+    enddef
+
+    const cmd = paginate
+        ? ['gh', 'api', '--paginate', endpoint]
+        : ['gh', 'api', endpoint]
+    job_start(cmd, {out_cb: OutCb, close_cb: CloseCb, err_cb: ErrCb})
+enddef
+
 def FetchPRData(owner: string, repo: string, pr: number)
     s_ctx        = {owner: owner, repo: repo, pr: pr}
     s_raw        = {}
@@ -181,36 +210,12 @@ def FetchPRData(owner: string, repo: string, pr: number)
 
     const base = '/repos/' .. owner .. '/' .. repo
 
-    const endpoints: dict<string> = {
-        issue_comments: base .. '/issues/' .. pr .. '/comments',
-        reviews:        base .. '/pulls/'  .. pr .. '/reviews',
-        diff_comments:  base .. '/pulls/'  .. pr .. '/comments',
-        commits:        base .. '/pulls/'  .. pr .. '/commits',
-    }
-
-    for [key, endpoint] in items(endpoints)
-        s_raw[key] = ''
-        s_pending += 1
-
-        const k = key
-
-        def OutCb(channel: channel, line: string)
-            s_raw[k] ..= line .. "\n"
-        enddef
-
-        def CloseCb(channel: channel)
-            s_pending -= 1
-        enddef
-
-        def ErrCb(channel: channel, msg: string)
-            echoerr '[pr_comments/' .. k .. '] ' .. msg
-        enddef
-
-        job_start(
-            ['gh', 'api', '--paginate', endpoint],
-            {out_cb: OutCb, close_cb: CloseCb, err_cb: ErrCb}
-        )
-    endfor
+    # Phase 1: fetch all PR-level data in parallel
+    StartFetchJob(base .. '/pulls/'  .. pr,                'pr_info',        false)
+    StartFetchJob(base .. '/issues/' .. pr .. '/comments', 'issue_comments')
+    StartFetchJob(base .. '/pulls/'  .. pr .. '/reviews',  'reviews')
+    StartFetchJob(base .. '/pulls/'  .. pr .. '/comments', 'diff_comments')
+    StartFetchJob(base .. '/pulls/'  .. pr .. '/commits',  'commits')
 
     # Dont like that it blocks, should be async
     # But user is expected to wait for this job, else no work to be done
@@ -218,19 +223,35 @@ def FetchPRData(owner: string, repo: string, pr: number)
     while s_pending > 0
         sleep 50m
     endwhile
+
+    # Phase 2: per-commit inline comments (need commit SHAs from phase 1)
+    # Commit comments are made directly on a commit (not via PR review), so
+    # they live at /commits/{sha}/comments rather than /pulls/{pr}/comments.
+    s_raw['commit_comments'] = ''
+    for c in MergePages(s_raw['commits'])
+        StartFetchJob(base .. '/commits/' .. c.sha .. '/comments', 'commit_comments')
+    endfor
+    while s_pending > 0
+        sleep 50m
+    endwhile
 enddef
 
 def RenderEvents(): list<string>
-    var issue_comments: list<dict<any>> = []
-    var reviews:        list<dict<any>> = []
-    var diff_comments:  list<dict<any>> = []
-    var commits:        list<dict<any>> = []
+    var issue_comments:  list<dict<any>> = []
+    var reviews:         list<dict<any>> = []
+    var diff_comments:   list<dict<any>> = []
+    var commits:         list<dict<any>> = []
+    var commit_comments: list<dict<any>> = []
+    var pr_info:         dict<any>       = {}
 
     try
-        issue_comments = MergePages(s_raw['issue_comments'])
-        reviews        = MergePages(s_raw['reviews'])
-        diff_comments  = MergePages(s_raw['diff_comments'])
-        commits        = MergePages(s_raw['commits'])
+        issue_comments  = MergePages(s_raw['issue_comments'])
+        reviews         = MergePages(s_raw['reviews'])
+        diff_comments   = MergePages(s_raw['diff_comments'])
+        commits         = MergePages(s_raw['commits'])
+        commit_comments = MergePages(get(s_raw, 'commit_comments', ''))
+        const pr_info_raw = trim(get(s_raw, 'pr_info', ''))
+        pr_info = empty(pr_info_raw) ? {} : json_decode(pr_info_raw)
     catch
         echoerr '[pr_comments] JSON decode failed: ' .. v:exception
         return []
@@ -326,6 +347,39 @@ def RenderEvents(): list<string>
         })
     endfor
 
+    for c in commit_comments
+        # Commit comments may be general (no path) or inline (path + line).
+        # Inline ones are treated like diff_thread entries and added to QF.
+        const path   = get(c, 'path', '')
+        const lineno = get(c, 'line', v:null)
+        if !empty(path) && type(lineno) == v:t_number
+            events->add({
+                kind:      'commit_comment',
+                user:      c.user.login,
+                body:      c.body,
+                path:      path,
+                lineno:    lineno,
+                linecount: 1,
+                loc:       path .. '#L' .. lineno,
+                outdated:  false,
+                replies:   [],
+                time:      c.created_at,
+                browse_url: c.html_url,
+                diff_hunk:  '',
+                sha:       c.commit_id[ : 6],
+            })
+        else
+            events->add({
+                kind:      'commit_comment',
+                user:      c.user.login,
+                body:      c.body,
+                time:      c.created_at,
+                browse_url: c.html_url,
+                sha:       c.commit_id[ : 6],
+            })
+        endif
+    endfor
+
     # Sort all of the stuff we parsed by incoming time
     # Notice that replies are surrogate, they dont get their own time-sorting
     events->sort((a, b) => a.time < b.time ? -1 : a.time > b.time ? 1 : 0)
@@ -337,13 +391,22 @@ def RenderEvents(): list<string>
 
     # Build lines, recording qf positions as we go
     #
-    # Header
-    # FIXME add PR title
+    # Header: metadata row, then optional title + body from pr_info
+    const pr_title = get(pr_info, 'title', '')
+    const pr_body  = get(pr_info, 'body',  v:null)
+
     var lines: list<string> = [
         RightAlign($"  PR #{s_ctx.pr} · {s_ctx.owner}/{s_ctx.repo}", strftime('%Y-%m-%d %H:%M')),
-        repeat('━', WIDTH),
-        '',
     ]
+    if !empty(pr_title)
+        lines->add('  ' .. pr_title)
+    endif
+    lines->add(repeat('━', WIDTH))
+    if type(pr_body) == v:t_string && !empty(pr_body)
+        lines += PrefixBody(pr_body, '  ', '  ')
+        lines->add(repeat('━', WIDTH))
+    endif
+    lines->add('')
 
     s_qf_items   = []
     s_lnum_to_qf = {}
@@ -359,6 +422,9 @@ def RenderEvents(): list<string>
         elseif e.kind == 'review'
             lines->add(RightAlign(
                 '  ◇  ' .. e.user .. ' ' .. ReviewLabel(e.state), ts))
+            if type(e.body) == v:t_string && !empty(e.body)
+                lines += PrefixBody(e.body, '  │  ', '  │  ')
+            endif
 
         elseif e.kind == 'issue_comment'
             lines->add(RightAlign('  ●  ' .. e.user .. ' commented', ts))
@@ -405,6 +471,37 @@ def RenderEvents(): list<string>
             endif
 
             s_qf_to_lnum_end[string(qf_idx)] = len(lines) + 1
+
+        elseif e.kind == 'commit_comment'
+            if has_key(e, 'path')
+                # Inline commit comment: register in quickfix like a diff_thread
+                const pr_buf_lnum = len(lines) + 1
+                const qf_idx      = len(s_qf_items) + 1
+                s_qf_items->add({
+                    filename: e.path,
+                    lnum:     e.lineno,
+                    col:      1,
+                    text:     '@' .. e.user .. '  ' .. e.loc
+                              .. '  [commit ' .. e.sha .. ']  '
+                              .. split(e.body, "\n")[0],
+                })
+                s_lnum_to_qf[string(pr_buf_lnum)]  = qf_idx
+                s_qf_to_lnum[string(qf_idx)]       = pr_buf_lnum
+                s_qf_to_lcount[string(qf_idx)]     = e.linecount
+                s_qf_to_comment[string(qf_idx)]    = e.body
+                s_qf_to_suggestion[string(qf_idx)] = ParseSuggestionFromEvent(e)
+                s_qf_to_browse_url[string(qf_idx)] = e.browse_url
+
+                lines->add(RightAlign(
+                    '  ●  ' .. e.user .. ' on commit ' .. e.sha .. ' in ' .. e.loc, ts))
+                lines += PrefixBody(e.body, '  │  ', '  │  ')
+                s_qf_to_lnum_end[string(qf_idx)] = len(lines) + 1
+            else
+                # General commit comment (no file/line context)
+                lines->add(RightAlign(
+                    '  ●  ' .. e.user .. ' on commit ' .. e.sha, ts))
+                lines += PrefixBody(e.body, '  │  ', '  │  ')
+            endif
         endif
     endfor
 
@@ -905,7 +1002,7 @@ def ApplyLocalLineOffsets(events: list<dict<any>>)
     var file_offsets: dict<list<dict<number>>> = {}
 
     for e in events
-        if e.kind == 'diff_thread'
+        if e.kind == 'diff_thread' || (e.kind == 'commit_comment' && has_key(e, 'path'))
             # Parse git diff to for changes in the working tree
             if !has_key(file_offsets, e.path)
                 var hunks: list<dict<number>> = []
