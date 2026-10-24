@@ -78,16 +78,16 @@ def LoadRepoFromCWD(strict: bool = true): any
 enddef
 
 def LoadPullNumFromWorktree(strict: bool = true): number
-    const cmd = $"gh pr list --search $(git rev-parse HEAD) --state open --json number -q '.[0].number'"
-    const result = system(cmd)
-    if v:shell_error != 0
+    const cmd = "gh pr view --json number,state -q 'select(.state == \"OPEN\").number'"
+    const result = system(cmd)->trim()
+    if v:shell_error != 0 || empty(result)
         if strict
-            throw "Current branch not sitting in a PR."
+            throw "Current branch not sitting in an open PR."
         endif
         return -1
     endif
 
-    # Still works if not on tip of PR, but older commit!
+    # Branch-based, so it still works with local commits on top
     return str2nr(result)
 enddef
 
@@ -126,12 +126,15 @@ def Load(arg: string = "")
     var target_repo  = ""
     var target_pr    = -1
 
-    # No arguments: Expects being in repo, will ask for PR number to fix
+    # No arguments: use the checked-out PR if any, else prompt
     if arg == ""
         const info = LoadRepoFromCWD()
         target_owner = info.owner
         target_repo  = info.repo
-        target_pr    = LoadPullNumFromPrompt(target_owner, target_repo)
+        target_pr    = LoadPullNumFromWorktree(false)
+        if target_pr <= 0
+            target_pr = LoadPullNumFromPrompt(target_owner, target_repo)
+        endif
 
     # Number argument: Expects being in repo. Will go straight to fixing
     elseif arg =~ '^\d\+$'
@@ -150,7 +153,7 @@ def Load(arg: string = "")
         throw "PRFix: Invalid argument: " .. arg
     endif
 
-    if target_pr == -1
+    if target_pr <= 0
         throw "Could not parse PR number"
     endif
 
@@ -512,7 +515,10 @@ export def PRHistoryBufferOnKeyEnter()
     const pr_hist_buf = bufnr()
 
     const lnum = PRHistoryBufferEventLineSeekBack()
-    const qf_idx = s_lnum_to_qf[lnum]
+    const qf_idx = get(s_lnum_to_qf, string(lnum), 0)
+    if qf_idx <= 0
+        return
+    endif
 
     # Move to the left window BEFORE executing the jump
     FocusWindowLeft()
@@ -529,7 +535,10 @@ enddef
 
 export def PRHistoryBufferOnKeyo()
     const lnum = PRHistoryBufferEventLineSeekBack()
-    const qf_idx = s_lnum_to_qf[lnum]
+    const qf_idx = get(s_lnum_to_qf, string(lnum), 0)
+    if qf_idx <= 0
+        return
+    endif
     CommentBrowse(qf_idx)
 enddef
 
@@ -544,8 +553,11 @@ export def PRHistoryBufferOnKeyH()
     # FIXME make this its own buffer type and allow better handling,
     # autoupdating etc. For now enough, for debugging
     const lnum = PRHistoryBufferEventLineSeekBack()
-    const qf_idx = s_lnum_to_qf[lnum]
-    const suggestion = s_qf_to_suggestion[string(qf_idx)]
+    const qf_idx = get(s_lnum_to_qf, string(lnum), 0)
+    if qf_idx <= 0
+        return
+    endif
+    const suggestion = get(s_qf_to_suggestion, string(qf_idx), {exists: false})
 
     if !suggestion.exists
         echom "No suggestion in current comment"
@@ -601,6 +613,9 @@ enddef
 
 def PRHistoryBufferOnQuickFixJump()
     const curr_qf_idx = getqflist({idx: 0}).idx
+    if curr_qf_idx <= 0
+        return
+    endif
 
     # Focus current QF-related comment on PRHistory
     const winid = bufwinid(s_pr_bufnr)
@@ -623,7 +638,7 @@ def PRHistoryBufferOnQuickFixJump()
     # Inject the suggestion-lines-list into register 'p' as Linewise block ('V')
     # This guarantees it will paste exactly as standard lines of code
     # May be empty and purposefully blow the register
-    const suggestion = s_qf_to_suggestion[curr_qf_idx]
+    const suggestion = get(s_qf_to_suggestion, string(curr_qf_idx), {lines: []})
     setreg('p', suggestion.lines, 'V')
 enddef
 
@@ -832,6 +847,10 @@ def CommentSelectLines(a_qf_idx: number = -1)
         curr_qf_idx = getqflist({idx: 0}).idx
     endif
 
+    if curr_qf_idx <= 0 || !has_key(s_qf_to_lcount, string(curr_qf_idx))
+        return
+    endif
+
     const lcount = s_qf_to_lcount[string(curr_qf_idx)]
     execute 'silent! cc ' .. curr_qf_idx
 
@@ -891,6 +910,10 @@ def CommentBrowse(a_qf_idx: number = -1)
     var curr_qf_idx = a_qf_idx
     if curr_qf_idx == -1
         curr_qf_idx = getqflist({idx: 0}).idx
+    endif
+
+    if curr_qf_idx <= 0 || !has_key(s_qf_to_browse_url, string(curr_qf_idx))
+        return
     endif
 
     const url = s_qf_to_browse_url[string(curr_qf_idx)]

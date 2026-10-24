@@ -95,15 +95,16 @@ run and removed when |:PRFixQuit| is called.
 *:PRFix* [{arg}]
     Start a PR review session.
 
-    With no argument, the plugin lists open PRs for the current repository
-    and prompts you to enter a PR number.  The currently checked-out PR (if
-    any) is marked with `*` in the list.
+    With no argument, the plugin uses the currently checked-out PR when the
+    current branch is associated with an open PR.  Otherwise it lists open
+    PRs for the current repository and prompts you to enter a PR number.  The
+    currently checked-out PR (if any) is marked with `*` in the list.
 
     {arg} may be:
 
         {number}    Go straight to the PR with that number without prompting.
-        .           Use the PR that corresponds to the currently checked-out
-                    branch (detected via `gh pr list --search <HEAD SHA>`).
+        .           Use the PR that corresponds to the currently-checked-out
+                    branch (detected via `gh pr view`).
 
     Startup sequence:
 

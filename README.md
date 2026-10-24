@@ -38,7 +38,7 @@ Plug 'pabsan-0/vim-pr-fix'
 Run `:PRFix` from any buffer inside a git repository:
 
 ```
-:PRFix          " prompt to choose an open PR
+:PRFix          " currently checked-out PR, or prompt if none
 :PRFix 42       " jump straight to PR #42
 :PRFix .        " use the currently checked-out PR
 ```
@@ -87,7 +87,7 @@ All session commands are registered when `:PRFix` is run and removed by `:PRFixQ
 
 | Command | Action |
 |---|---|
-| `:PRFix [arg]` | Start a PR review session (no arg = prompt; number = direct; `.` = current branch) |
+| `:PRFix [arg]` | Start a PR review session (no arg = current PR, or prompt if none; number = direct; `.` = current branch) |
 | `:PRFixHistoryToggle` | Show or hide the PR History buffer |
 | `:PRFixApplySuggestion [n]` | Apply the suggestion from QF entry *n* (default: current) in-place |
 | `:PRFixSelectLines [n]` | Visually select the lines referenced by QF entry *n* (default: current) |
